@@ -1,0 +1,659 @@
+pragma language_version >= 0.22;
+
+import CompactStandardLibrary;
+
+struct VerifierKey {
+  x: Field;
+  y: Field;
+}
+
+struct SchnorrSignature {
+  rX: Field;
+  rY: Field;
+  s: Field;
+  h: Field;
+  hQuotient: Uint<8>;
+}
+
+struct PendingKey {
+  x: Field;
+  y: Field;
+  effective: Uint<64>;
+}
+
+struct CommitteeKeys {
+  slot0: VerifierKey;
+  slot1: VerifierKey;
+  slot2: VerifierKey;
+  slot3: VerifierKey;
+  slot4: VerifierKey;
+  slotCount: Uint<8>;
+}
+
+struct ChainConfig {
+  chainId: Uint<8>;
+  enabled: Boolean;
+  certDomain: Bytes<32>;
+}
+
+struct LossCertHeader {
+  accountId: Bytes<32>;
+  chainId: Uint<8>;
+  escrowRef: Bytes<32>;
+  lossAmount: Uint<128>;
+  certNonce: Uint<64>;
+}
+
+struct SettlementCertHeader {
+  accountId: Bytes<32>;
+  chainId: Uint<8>;
+  escrowRef: Bytes<32>;
+  withdrawAmount: Uint<128>;
+  certNonce: Uint<64>;
+}
+
+struct EscrowBinding {
+  chainId: Uint<8>;
+  escrowRef: Bytes<32>;
+  clawbackAuthHash: Bytes<32>;
+  cap: Uint<128>;
+  expiresAt: Uint<64>;
+}
+
+witness sequencerSecret(): Maybe<Bytes<32>>;
+
+witness governorSecret(): Maybe<Bytes<32>>;
+
+witness jubjubFrModulusWitness(): Field;
+
+witness currentTime(): Uint<64>;
+
+witness committeeSlotChoice0(): Uint<8>;
+
+witness committeeSlotChoice1(): Uint<8>;
+
+witness committeeSlotChoice2(): Uint<8>;
+
+circuit hashSignerPk(sk: Bytes<32>, domain: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([domain, sk]);
+}
+
+circuit requireSequencer(): [] {
+  const k = sequencerSecret();
+  assert(k.is_some, "No sequencer secret");
+  const pk = disclose(hashSignerPk(k.value, pad(32, "ascend:sequencer:v1")));
+  assert(pk == sequencerPk, "Not sequencer");
+}
+
+circuit requireGovernor(): [] {
+  const k = governorSecret();
+  assert(k.is_some, "No governor secret");
+  const pk = disclose(hashSignerPk(k.value, pad(32, "ascend:governor:v1")));
+  assert(pk == governorPk, "Not governor");
+}
+
+circuit jubjubFrModulus(): Field {
+  return disclose(jubjubFrModulusWitness());
+}
+
+circuit nowBounded(): Uint<64> {
+  const t = disclose(currentTime());
+  assert(blockTimeGte(t), "currentTime must not exceed block time");
+  assert(blockTimeLt((t + 60 as Uint<64>) as Uint<64>),
+         "currentTime must be within 60s of block time"
+         );
+  return t;
+}
+
+circuit verifySchnorr(sig: SchnorrSignature, vk: VerifierKey, messageHash: Field): [] {
+  const pubKey: JubjubPoint = constructJubjubPoint(vk.x, vk.y);
+  const sG: JubjubPoint = ecMulGenerator(sig.s);
+  const hAec: JubjubPoint = ecMul(pubKey, sig.h);
+  const R: JubjubPoint = ecAdd(sG, hAec);
+  assert(sig.rX == jubjubPointX(R), "Schnorr: R x mismatch");
+  assert(sig.rY == jubjubPointY(R), "Schnorr: R y mismatch");
+  const hR: Field = transientHash<Vector<2, Field>>([sig.rX, sig.rY]);
+  const hA: Field = transientHash<Vector<2, Field>>([vk.x, vk.y]);
+  const hFull: Field = transientHash<Vector<3, Field>>([hR, hA, messageHash]);
+  const Q: Field = jubjubFrModulus();
+  const qField: Field = sig.hQuotient as Field;
+  const reconstructed: Field = (sig.h + qField * Q) as Field;
+  assert(reconstructed == hFull, "Schnorr: challenge not bound to message");
+}
+
+circuit assertAndBumpUserHwm(scopeTag: Bytes<32>, accountId: Bytes<32>, nonce: Uint<64>): [] {
+  const key = disclose(persistentHash<Vector<2, Bytes<32>>>([scopeTag, accountId]));
+  const current = userNonceHwm.member(key) ? userNonceHwm.lookup(key) : 0 as Uint<64>;
+  assert(nonce > current, "Nonce must be strictly increasing");
+  userNonceHwm.insert(key, nonce);
+}
+
+circuit assertAndBumpCertHwm(accountId: Bytes<32>, certNonce: Uint<64>): [] {
+  const current = certNonceHwm.member(accountId) ? certNonceHwm.lookup(accountId) : 0 as Uint<64>;
+  assert(certNonce > current, "Cert nonce must be strictly increasing");
+  certNonceHwm.insert(accountId, certNonce);
+}
+
+circuit bindingKey(accountId: Bytes<32>, chainId: Uint<8>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:binding"), accountId, chainId as Bytes<32>,]
+           );
+}
+
+circuit pendingKeyKey(chainId: Uint<8>, slotId: Uint<8>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:committee:pending"), chainId as Bytes<32>, slotId as Bytes<32>,]
+           );
+}
+
+circuit assertSlotNonZero(k: VerifierKey, idx: Uint<8>): [] {
+  if (idx == 0 as Uint<8>) {
+    assert(k.x != 0 || k.y != 0, "slot 0 zero");
+  } else if (idx == 1 as Uint<8>) {
+    assert(k.x != 0 || k.y != 0, "slot 1 zero");
+  } else if (idx == 2 as Uint<8>) {
+    assert(k.x != 0 || k.y != 0, "slot 2 zero");
+  } else if (idx == 3 as Uint<8>) {
+    assert(k.x != 0 || k.y != 0, "slot 3 zero");
+  } else {
+    assert(k.x != 0 || k.y != 0, "slot 4 zero");
+  }
+}
+
+circuit assertCommitteeDistinct(c: CommitteeKeys): [] {
+
+  assertSlotNonZero(c.slot0, 0 as Uint<8>);
+  assertSlotNonZero(c.slot1, 1 as Uint<8>);
+  assertSlotNonZero(c.slot2, 2 as Uint<8>);
+  assertSlotNonZero(c.slot3, 3 as Uint<8>);
+  assertSlotNonZero(c.slot4, 4 as Uint<8>);
+
+  assert(!(c.slot0.x == c.slot1.x && c.slot0.y == c.slot1.y), "slots 0,1 equal");
+  assert(!(c.slot0.x == c.slot2.x && c.slot0.y == c.slot2.y), "slots 0,2 equal");
+  assert(!(c.slot0.x == c.slot3.x && c.slot0.y == c.slot3.y), "slots 0,3 equal");
+  assert(!(c.slot0.x == c.slot4.x && c.slot0.y == c.slot4.y), "slots 0,4 equal");
+  assert(!(c.slot1.x == c.slot2.x && c.slot1.y == c.slot2.y), "slots 1,2 equal");
+  assert(!(c.slot1.x == c.slot3.x && c.slot1.y == c.slot3.y), "slots 1,3 equal");
+  assert(!(c.slot1.x == c.slot4.x && c.slot1.y == c.slot4.y), "slots 1,4 equal");
+  assert(!(c.slot2.x == c.slot3.x && c.slot2.y == c.slot3.y), "slots 2,3 equal");
+  assert(!(c.slot2.x == c.slot4.x && c.slot2.y == c.slot4.y), "slots 2,4 equal");
+  assert(!(c.slot3.x == c.slot4.x && c.slot3.y == c.slot4.y), "slots 3,4 equal");
+}
+
+circuit pickKey(c: CommitteeKeys, idx: Uint<8>): VerifierKey {
+  if (idx == 0 as Uint<8>) {
+    return c.slot0;
+  } else if (idx == 1 as Uint<8>) {
+    return c.slot1;
+  } else if (idx == 2 as Uint<8>) {
+    return c.slot2;
+  } else if (idx == 3 as Uint<8>) {
+    return c.slot3;
+  } else {
+    return c.slot4;
+  }
+}
+
+circuit verifyCommitteeQuorum(
+          sigs: Vector<3, SchnorrSignature>,
+          committee: CommitteeKeys,
+          messageHash: Field,
+          ): [] {
+  const i0 = disclose(committeeSlotChoice0());
+  const i1 = disclose(committeeSlotChoice1());
+  const i2 = disclose(committeeSlotChoice2());
+  assert(i0 < 5 as Uint<8>, "slot0 out of range");
+  assert(i1 < 5 as Uint<8>, "slot1 out of range");
+  assert(i2 < 5 as Uint<8>, "slot2 out of range");
+  assert(i0 != i1, "slot0 == slot1");
+  assert(i0 != i2, "slot0 == slot2");
+  assert(i1 != i2, "slot1 == slot2");
+  verifySchnorr(sigs[0], pickKey(committee, i0), messageHash);
+  verifySchnorr(sigs[1], pickKey(committee, i1), messageHash);
+  verifySchnorr(sigs[2], pickKey(committee, i2), messageHash);
+}
+
+circuit hashRegisterIntent(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          clawbackAuthHash: Bytes<32>,
+          cap: Uint<128>,
+          expiresAt: Uint<64>,
+          userPkX: Field,
+          userPkY: Field,
+          nonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<10, Bytes<32>>>(
+           [pad(32, "ascend:perps:register"),
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            clawbackAuthHash,
+            cap as Bytes<32>,
+            expiresAt as Bytes<32>,
+            userPkX as Bytes<32>,
+            userPkY as Bytes<32>,
+            nonce as Bytes<32>,]
+           );
+}
+
+circuit hashAttestBatch(
+          prevFillRoot: Bytes<32>,
+          newFillRoot: Bytes<32>,
+          batchHash: Bytes<32>,
+          prevPositionsRoot: Bytes<32>,
+          newPositionsRoot: Bytes<32>,
+          prevAccountStateRoot: Bytes<32>,
+          newAccountStateRoot: Bytes<32>,
+          batchProofCommitment: Bytes<32>,
+          ): Bytes<32> {
+  return persistentHash<Vector<9, Bytes<32>>>(
+           [pad(32, "ascend:perps:attest"),
+            prevFillRoot,
+            newFillRoot,
+            batchHash,
+            prevPositionsRoot,
+            newPositionsRoot,
+            prevAccountStateRoot,
+            newAccountStateRoot,
+            batchProofCommitment,]
+           );
+}
+
+circuit hashLossCert(h: LossCertHeader, domain: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<6, Bytes<32>>>(
+           [domain,
+            h.accountId,
+            h.chainId as Bytes<32>,
+            h.escrowRef,
+            h.lossAmount as Bytes<32>,
+            h.certNonce as Bytes<32>,]
+           );
+}
+
+circuit hashSettlementCert(h: SettlementCertHeader, domain: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<6, Bytes<32>>>(
+           [domain,
+            h.accountId,
+            h.chainId as Bytes<32>,
+            h.escrowRef,
+            h.withdrawAmount as Bytes<32>,
+            h.certNonce as Bytes<32>,]
+           );
+}
+
+export ledger governorPk: Bytes<32>;
+
+export ledger sequencerPk: Bytes<32>;
+
+export ledger attestorPk: VerifierKey;
+
+export ledger pendingAttestorPk: PendingKey;
+
+export ledger pendingAttestorActive: Boolean;
+
+export ledger escrowBindings: Map<Bytes<32>, EscrowBinding>;
+
+export ledger issuedClawback: Map<Bytes<32>, Uint<128>>;
+
+export ledger issuedSettlement: Map<Bytes<32>, Uint<128>>;
+
+export ledger chainConfigs: Map<Uint<8>, ChainConfig>;
+
+export ledger committees: Map<Uint<8>, CommitteeKeys>;
+
+export ledger pendingCommitteeKeys: Map<Bytes<32>, PendingKey>;
+
+export ledger pendingRotationChain: Map<Uint<8>, Boolean>;
+
+export ledger attestedFillBatchRoot: Bytes<32>;
+
+export ledger positionsRoot: Bytes<32>;
+
+export ledger accountStateRoot: Bytes<32>;
+
+export ledger batchProofCommitment: Bytes<32>;
+
+export ledger attestationCount: Uint<64>;
+
+export ledger issuedLossCertCount: Uint<64>;
+
+export ledger issuedSettlementCertCount: Uint<64>;
+
+export ledger userNonceHwm: Map<Bytes<32>, Uint<64>>;
+
+export ledger certNonceHwm: Map<Bytes<32>, Uint<64>>;
+
+export ledger pausedCerts: Boolean;
+
+constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field,) {
+  assert(initGovPk != pad(32, ""), "governor pk zero");
+  assert(initSeqPk != pad(32, ""), "sequencer pk zero");
+  assert(initAttestorX != 0 || initAttestorY != 0, "attestor pk zero");
+  governorPk = disclose(initGovPk);
+  sequencerPk = disclose(initSeqPk);
+  attestorPk = disclose(VerifierKey { x: initAttestorX, y: initAttestorY });
+  attestedFillBatchRoot = disclose(pad(32, ""));
+  positionsRoot = disclose(pad(32, ""));
+
+  accountStateRoot = disclose(pad(32, ""));
+  batchProofCommitment = disclose(pad(32, ""));
+  attestationCount = disclose(0 as Uint<64>);
+  issuedLossCertCount = disclose(0 as Uint<64>);
+  issuedSettlementCertCount = disclose(0 as Uint<64>);
+  pendingAttestorActive = disclose(false);
+  pausedCerts = disclose(false);
+}
+
+export circuit registerChain(
+                 chainId: Uint<8>,
+                 certDomain: Bytes<32>,
+                 k0x: Field,
+                 k0y: Field,
+                 k1x: Field,
+                 k1y: Field,
+                 k2x: Field,
+                 k2y: Field,
+                 k3x: Field,
+                 k3y: Field,
+                 k4x: Field,
+                 k4y: Field,
+                 ): [] {
+  requireGovernor();
+  const dChain = disclose(chainId);
+  assert(!chainConfigs.member(dChain), "Chain already registered");
+  chainConfigs.insert(
+    dChain,
+    disclose(ChainConfig { chainId: chainId, enabled: true, certDomain: certDomain, })
+    );
+  const newCommittee =
+          CommitteeKeys { slot0: VerifierKey { x: k0x, y: k0y },
+                          slot1: VerifierKey { x: k1x, y: k1y },
+                          slot2: VerifierKey { x: k2x, y: k2y },
+                          slot3: VerifierKey { x: k3x, y: k3y },
+                          slot4: VerifierKey { x: k4x, y: k4y },
+                          slotCount: 5 as Uint<8>, };
+  assertCommitteeDistinct(newCommittee);
+  committees.insert(dChain, disclose(newCommittee));
+}
+
+export circuit proposeCommitteeKey(chainId: Uint<8>, slotId: Uint<8>, newX: Field, newY: Field,): [] {
+  requireGovernor();
+  assert(disclose(slotId) < 5 as Uint<8>, "slot out of range");
+  const dChain = disclose(chainId);
+  const hasPending =
+          pendingRotationChain.member(dChain) ? pendingRotationChain.lookup(dChain) : false;
+  assert(!hasPending, "Pending rotation already in flight on this chain");
+  pendingRotationChain.insert(dChain, true);
+  const nowTs = nowBounded();
+  const key = disclose(pendingKeyKey(chainId, slotId));
+  pendingCommitteeKeys.insert(
+    key,
+    disclose(PendingKey { x: newX, y: newY, effective: (nowTs + 86400 as Uint<64>) as Uint<64>, })
+    );
+}
+
+export circuit activateCommitteeKey(chainId: Uint<8>, slotId: Uint<8>): [] {
+  requireGovernor();
+  const dChain = disclose(chainId);
+  const dSlot = disclose(slotId);
+  const key = disclose(pendingKeyKey(chainId, slotId));
+  assert(pendingCommitteeKeys.member(key), "No pending key for this slot");
+  const pending = pendingCommitteeKeys.lookup(key);
+  assert(blockTimeGte(pending.effective), "Timelock not elapsed");
+  assert(committees.member(dChain), "Chain not registered");
+  const c = committees.lookup(dChain);
+  const newKey = VerifierKey { x: pending.x, y: pending.y };
+  const updated = dSlot == 0 as Uint<8>
+                    ? CommitteeKeys { slot0: newKey,
+                                      slot1: c.slot1,
+                                      slot2: c.slot2,
+                                      slot3: c.slot3,
+                                      slot4: c.slot4,
+                                      slotCount: c.slotCount }
+                    : dSlot == 1 as Uint<8>
+                        ? CommitteeKeys { slot0: c.slot0,
+                                          slot1: newKey,
+                                          slot2: c.slot2,
+                                          slot3: c.slot3,
+                                          slot4: c.slot4,
+                                          slotCount: c.slotCount }
+                        : dSlot == 2 as Uint<8>
+                            ? CommitteeKeys { slot0: c.slot0,
+                                              slot1: c.slot1,
+                                              slot2: newKey,
+                                              slot3: c.slot3,
+                                              slot4: c.slot4,
+                                              slotCount: c.slotCount }
+                            : dSlot == 3 as Uint<8>
+                                ? CommitteeKeys { slot0: c.slot0,
+                                                  slot1: c.slot1,
+                                                  slot2: c.slot2,
+                                                  slot3: newKey,
+                                                  slot4: c.slot4,
+                                                  slotCount: c.slotCount }
+                                : CommitteeKeys { slot0: c.slot0,
+                                                  slot1: c.slot1,
+                                                  slot2: c.slot2,
+                                                  slot3: c.slot3,
+                                                  slot4: newKey,
+                                                  slotCount: c.slotCount };
+  assertCommitteeDistinct(updated);
+  committees.insert(dChain, disclose(updated));
+  pendingRotationChain.insert(dChain, false);
+
+  pendingCommitteeKeys.remove(key);
+}
+
+export circuit registerEscrowBinding(
+                 accountId: Bytes<32>,
+                 chainId: Uint<8>,
+                 escrowRef: Bytes<32>,
+                 clawbackAuthHash: Bytes<32>,
+                 cap: Uint<128>,
+                 expiresAt: Uint<64>,
+                 nonce: Uint<64>,
+                 userPkX: Field,
+                 userPkY: Field,
+                 userSig: SchnorrSignature,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedCerts, "Certs paused");
+
+  const dAccountId = disclose(accountId);
+  const dChain = disclose(chainId);
+  assert(chainConfigs.member(dChain), "Chain not registered");
+
+  const dPkX = disclose(userPkX);
+  const dPkY = disclose(userPkY);
+  assert(dPkX != 0 || dPkY != 0, "user pk zero");
+
+  const dNonce = disclose(nonce);
+  assertAndBumpUserHwm(pad(32, "settlement:user-reg"), dAccountId, dNonce);
+
+  const dCap = disclose(cap);
+  const currentClawback =
+          issuedClawback.member(dAccountId) ? issuedClawback.lookup(dAccountId) : 0 as Uint<128>;
+  assert(dCap >= currentClawback, "cap below already-issued clawback");
+
+  const userKey = VerifierKey { x: dPkX, y: dPkY };
+  const userMsg = degradeToTransient(
+                    hashRegisterIntent(
+                      dAccountId,
+                      dChain,
+                      disclose(escrowRef),
+                      disclose(clawbackAuthHash),
+                      dCap,
+                      disclose(expiresAt),
+                      dPkX,
+                      dPkY,
+                      dNonce,
+                      )
+                    );
+  verifySchnorr(userSig, userKey, userMsg);
+
+  const bKey = disclose(bindingKey(dAccountId, dChain));
+  escrowBindings.insert(
+    bKey,
+    disclose(EscrowBinding { chainId: chainId,
+                             escrowRef: escrowRef,
+                             clawbackAuthHash: clawbackAuthHash,
+                             cap: cap,
+                             expiresAt: expiresAt, })
+    );
+}
+
+export circuit attestBatch(
+                 prevFillRoot: Bytes<32>,
+                 newFillRoot: Bytes<32>,
+                 batchHash: Bytes<32>,
+                 prevPositionsRoot: Bytes<32>,
+                 newPositionsRoot: Bytes<32>,
+                 prevAccountStateRoot: Bytes<32>,
+                 newAccountStateRoot: Bytes<32>,
+                 newBatchProofCommitment: Bytes<32>,
+                 attestorSig: SchnorrSignature,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedCerts, "Certs paused");
+
+  const dPrev = disclose(prevFillRoot);
+  const dNew = disclose(newFillRoot);
+  const dBh = disclose(batchHash);
+  const dPrevPos = disclose(prevPositionsRoot);
+  const dNewPos = disclose(newPositionsRoot);
+  const dPrevAcc = disclose(prevAccountStateRoot);
+  const dNewAcc = disclose(newAccountStateRoot);
+  const dCommit = disclose(newBatchProofCommitment);
+
+  assert(dPrev == attestedFillBatchRoot, "Fill-root prev mismatch");
+  assert(dPrevPos == positionsRoot, "Positions-root prev mismatch");
+
+  assert(dPrevAcc == accountStateRoot, "Account-state-root prev mismatch");
+  assert(dBh != pad(32, ""), "Empty batch hash");
+
+  const msg = degradeToTransient(
+                hashAttestBatch(dPrev, dNew, dBh, dPrevPos, dNewPos, dPrevAcc, dNewAcc, dCommit,)
+                );
+  verifySchnorr(attestorSig, attestorPk, msg);
+
+  attestedFillBatchRoot = dNew;
+  positionsRoot = dNewPos;
+  accountStateRoot = dNewAcc;
+  batchProofCommitment = dCommit;
+  attestationCount = disclose((attestationCount + 1) as Uint<64>);
+}
+
+export circuit issueLossCertificate(header: LossCertHeader, sigs: Vector<3, SchnorrSignature>,): [] {
+  requireSequencer();
+  assert(!pausedCerts, "Certs paused");
+
+  const dAccountId = disclose(header.accountId);
+  const dChain = disclose(header.chainId);
+  const dEscrow = disclose(header.escrowRef);
+  const dLoss = disclose(header.lossAmount);
+  const dCertNonce = disclose(header.certNonce);
+  assert(dLoss >= 1, "loss must be positive");
+
+  assertAndBumpCertHwm(dAccountId, dCertNonce);
+
+  const bKey = disclose(bindingKey(dAccountId, dChain));
+  assert(escrowBindings.member(bKey), "No escrow binding for (account, chain)");
+  const b = escrowBindings.lookup(bKey);
+  assert(b.escrowRef == dEscrow, "escrowRef mismatch");
+
+  const nowTs = nowBounded();
+  assert(nowTs <= b.expiresAt, "Clawback authorization expired");
+
+  const prevClawback =
+          issuedClawback.member(dAccountId) ? issuedClawback.lookup(dAccountId) : 0 as Uint<128>;
+  assert(prevClawback <= b.cap, "Internal: clawback already exceeds cap");
+  assert(dLoss <= (b.cap - prevClawback) as Uint<128>, "Clawback exceeds cap");
+
+  assert(chainConfigs.member(dChain), "Chain not registered");
+  const cfg = chainConfigs.lookup(dChain);
+  const committee = committees.lookup(dChain);
+  const certHash = hashLossCert(header, cfg.certDomain);
+  const msg = degradeToTransient(certHash);
+  verifyCommitteeQuorum(sigs, committee, msg);
+
+  issuedClawback.insert(dAccountId, disclose((prevClawback + dLoss) as Uint<128>));
+  issuedLossCertCount = disclose((issuedLossCertCount + 1) as Uint<64>);
+}
+
+export circuit issueSettlementCertificate(
+                 header: SettlementCertHeader,
+                 positionsRootAtIssue: Bytes<32>,
+                 sigs: Vector<3, SchnorrSignature>,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedCerts, "Certs paused");
+
+  const dAccountId = disclose(header.accountId);
+  const dChain = disclose(header.chainId);
+  const dEscrow = disclose(header.escrowRef);
+  const dAmount = disclose(header.withdrawAmount);
+  const dCertNonce = disclose(header.certNonce);
+  const dPositionsRoot = disclose(positionsRootAtIssue);
+  assert(dAmount >= 1, "amount must be positive");
+
+  assert(dPositionsRoot == positionsRoot, "positionsRoot mismatch");
+
+  assertAndBumpCertHwm(dAccountId, dCertNonce);
+
+  const bKey = disclose(bindingKey(dAccountId, dChain));
+  assert(escrowBindings.member(bKey), "No escrow binding for (account, chain)");
+  const b = escrowBindings.lookup(bKey);
+  assert(b.escrowRef == dEscrow, "escrowRef mismatch");
+
+  const nowTs = nowBounded();
+  assert(nowTs <= b.expiresAt, "Settlement authorization expired");
+
+  const prevSettlement =
+          issuedSettlement.member(dAccountId) ? issuedSettlement.lookup(dAccountId) : 0 as Uint<128>;
+  assert(prevSettlement <= b.cap, "Internal: settlement already exceeds cap");
+  assert(dAmount <= (b.cap - prevSettlement) as Uint<128>, "Settlement exceeds cap");
+
+  assert(chainConfigs.member(dChain), "Chain not registered");
+  const cfg = chainConfigs.lookup(dChain);
+  const committee = committees.lookup(dChain);
+  const certHash = hashSettlementCert(header, cfg.certDomain);
+  const msg = degradeToTransient(certHash);
+  verifyCommitteeQuorum(sigs, committee, msg);
+
+  issuedSettlement.insert(dAccountId, disclose((prevSettlement + dAmount) as Uint<128>));
+  issuedSettlementCertCount = disclose((issuedSettlementCertCount + 1) as Uint<64>);
+}
+
+export circuit pruneStaleEscrowBinding(accountId: Bytes<32>, chainId: Uint<8>,): [] {
+  requireSequencer();
+  const bKey = disclose(bindingKey(disclose(accountId), disclose(chainId)));
+  assert(escrowBindings.member(bKey), "No escrow binding to prune");
+  const b = escrowBindings.lookup(bKey);
+  const nowTs = nowBounded();
+  assert(b.expiresAt < nowTs, "Binding not yet expired");
+  escrowBindings.remove(bKey);
+}
+
+export circuit setPausedCerts(p: Boolean): [] {
+  requireGovernor();
+  pausedCerts = disclose(p);
+}
+
+export circuit proposeAttestorKey(newX: Field, newY: Field): [] {
+  requireGovernor();
+  assert(newX != 0 || newY != 0, "attestor pk zero");
+  const nowTs = nowBounded();
+  pendingAttestorPk =
+    disclose(PendingKey { x: newX, y: newY, effective: (nowTs + 86400 as Uint<64>) as Uint<64>, });
+  pendingAttestorActive = disclose(true);
+}
+
+export circuit activateAttestorKey(): [] {
+  requireGovernor();
+  assert(pendingAttestorActive, "No pending attestor key");
+  assert(blockTimeGte(pendingAttestorPk.effective), "Timelock not elapsed");
+  attestorPk = VerifierKey { x: pendingAttestorPk.x, y: pendingAttestorPk.y };
+  pendingAttestorActive = disclose(false);
+}

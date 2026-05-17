@@ -1,0 +1,830 @@
+pragma language_version >= 0.22;
+
+import CompactStandardLibrary;
+
+struct VerifierKey {
+  x: Field;
+  y: Field;
+}
+
+struct SchnorrSignature {
+  rX: Field;
+  rY: Field;
+  s: Field;
+  h: Field;
+  hQuotient: Uint<8>;
+}
+
+struct PendingKey {
+  x: Field;
+  y: Field;
+  effective: Uint<64>;
+}
+
+struct MarketConfig {
+  marketIndex: Uint<16>;
+  status: Uint<8>;
+  takerFee: Uint<32>;
+  makerFee: Uint<32>;
+  liquidationFee: Uint<32>;
+  defaultIMF: Uint<16>;
+  minIMF: Uint<16>;
+  maintenanceMF: Uint<16>;
+  closeOutMF: Uint<16>;
+  quoteMultiplier: Uint<32>;
+  interestRate: Uint<32>;
+  fundingClampSmall: Uint<32>;
+  fundingClampBig: Uint<32>;
+  openInterestLimit: Uint<64>;
+  minBaseAmount: Uint<64>;
+}
+
+struct MarketState {
+  markPrice: Uint<32>;
+  indexPrice: Uint<32>;
+  openInterest: Uint<64>;
+  fundingIndex: Uint<128>;
+  fundingIsNeg: Boolean;
+  lastFundingTs: Uint<64>;
+  totalVolume: Uint<128>;
+}
+
+struct Position {
+  size: Uint<64>;
+  isLong: Boolean;
+  entryPrice: Uint<64>;
+  entryQuote: Uint<128>;
+  lastFundingIndex: Uint<128>;
+  lastFundingIsNeg: Boolean;
+}
+
+struct Order {
+  accountId: Bytes<32>;
+  marketIndex: Uint<16>;
+  price: Uint<32>;
+  size: Uint<64>;
+  remainingSize: Uint<64>;
+  isAsk: Boolean;
+  orderType: Uint<8>;
+  expiresAt: Uint<64>;
+}
+
+struct EscrowMirror {
+  chainId: Uint<8>;
+  escrowBindingHash: Bytes<32>;
+  expiresAt: Uint<64>;
+}
+
+witness sequencerSecret(): Maybe<Bytes<32>>;
+
+witness governorSecret(): Maybe<Bytes<32>>;
+
+witness jubjubFrModulusWitness(): Field;
+
+witness currentTime(): Uint<64>;
+
+circuit hashSignerPk(sk: Bytes<32>, domain: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([domain, sk]);
+}
+
+circuit requireSequencer(): [] {
+  const k = sequencerSecret();
+  assert(k.is_some, "No sequencer secret");
+  const pk = disclose(hashSignerPk(k.value, pad(32, "ascend:sequencer:v1")));
+  assert(pk == sequencerPk, "Not sequencer");
+}
+
+circuit requireGovernor(): [] {
+  const k = governorSecret();
+  assert(k.is_some, "No governor secret");
+  const pk = disclose(hashSignerPk(k.value, pad(32, "ascend:governor:v1")));
+  assert(pk == governorPk, "Not governor");
+}
+
+circuit jubjubFrModulus(): Field {
+  return disclose(jubjubFrModulusWitness());
+}
+
+circuit nowBounded(): Uint<64> {
+  const t = disclose(currentTime());
+  assert(blockTimeGte(t), "currentTime must not exceed block time");
+  assert(blockTimeLt((t + 60 as Uint<64>) as Uint<64>),
+         "currentTime must be within 60s of block time"
+         );
+  return t;
+}
+
+circuit verifySchnorr(sig: SchnorrSignature, vk: VerifierKey, messageHash: Field): [] {
+  const pubKey: JubjubPoint = constructJubjubPoint(vk.x, vk.y);
+  const sG: JubjubPoint = ecMulGenerator(sig.s);
+  const hAec: JubjubPoint = ecMul(pubKey, sig.h);
+  const R: JubjubPoint = ecAdd(sG, hAec);
+  assert(sig.rX == jubjubPointX(R), "Schnorr: R x mismatch");
+  assert(sig.rY == jubjubPointY(R), "Schnorr: R y mismatch");
+  const hR: Field = transientHash<Vector<2, Field>>([sig.rX, sig.rY]);
+  const hA: Field = transientHash<Vector<2, Field>>([vk.x, vk.y]);
+  const hFull: Field = transientHash<Vector<3, Field>>([hR, hA, messageHash]);
+  const Q: Field = jubjubFrModulus();
+  const qField: Field = sig.hQuotient as Field;
+  const reconstructed: Field = (sig.h + qField * Q) as Field;
+  assert(reconstructed == hFull, "Schnorr: challenge not bound to message");
+}
+
+circuit assertAndBumpHwm(scopeTag: Bytes<32>, accountId: Bytes<32>, nonce: Uint<64>): [] {
+  const key = disclose(persistentHash<Vector<2, Bytes<32>>>([scopeTag, accountId]));
+  const current = userNonceHwm.member(key) ? userNonceHwm.lookup(key) : 0 as Uint<64>;
+  assert(nonce > current, "Nonce must be strictly increasing");
+  userNonceHwm.insert(key, nonce);
+}
+
+circuit assertAndBumpReceiptHwm(accountId: Bytes<32>, receiptNonce: Uint<64>): [] {
+  const current = attestorReceiptHwm.member(accountId)
+                    ? attestorReceiptHwm.lookup(accountId)
+                    : 0 as Uint<64>;
+  assert(receiptNonce > current, "Receipt nonce must be strictly increasing");
+  attestorReceiptHwm.insert(accountId, receiptNonce);
+}
+
+circuit positionKey(accountId: Bytes<32>, marketIndex: Uint<16>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:position"), accountId, marketIndex as Bytes<32>,]
+           );
+}
+
+circuit orderKey(accountId: Bytes<32>, nonce: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:order"), accountId, nonce as Bytes<32>,]
+           );
+}
+
+circuit notionalQuote(size: Uint<64>, price: Uint<32>): Uint<128> {
+  const sizeF = size as Field;
+  const priceF = price as Field;
+  return (sizeF * priceF) as Uint<128>;
+}
+
+circuit applyFillToPosition(
+          old: Position,
+          fillSize: Uint<64>,
+          fillPrice: Uint<32>,
+          fillIsLong: Boolean,
+          st: MarketState,
+          ): Position {
+  const fillQuote = notionalQuote(fillSize, fillPrice);
+  if (old.size == 0 as Uint<64>) {
+    return Position { size: fillSize,
+                      isLong: fillIsLong,
+                      entryPrice: fillPrice as Uint<64>,
+                      entryQuote: fillQuote,
+                      lastFundingIndex: st.fundingIndex,
+                      lastFundingIsNeg: st.fundingIsNeg, };
+  } else if (old.isLong == fillIsLong) {
+    const newSize = (old.size + fillSize) as Uint<64>;
+    const newQuote = (old.entryQuote + fillQuote) as Uint<128>;
+    return Position { size: newSize,
+                      isLong: old.isLong,
+                      entryPrice: old.entryPrice,
+                      entryQuote: newQuote,
+                      lastFundingIndex: st.fundingIndex,
+                      lastFundingIsNeg: st.fundingIsNeg, };
+  } else if (fillSize <= old.size) {
+    const newSize = (old.size - fillSize) as Uint<64>;
+    const oldEntryF = old.entryPrice as Field;
+    const newSizeF = newSize as Field;
+    const newQuote = newSize == 0 as Uint<64> ? 0 as Uint<128> : (oldEntryF * newSizeF) as Uint<128>;
+    const newEntry = newSize == 0 as Uint<64> ? 0 as Uint<64> : old.entryPrice;
+    return Position { size: newSize,
+                      isLong: old.isLong,
+                      entryPrice: newEntry,
+                      entryQuote: newQuote,
+                      lastFundingIndex: st.fundingIndex,
+                      lastFundingIsNeg: st.fundingIsNeg, };
+  } else {
+    const flipSize = (fillSize - old.size) as Uint<64>;
+    const flipQuote = notionalQuote(flipSize, fillPrice);
+    return Position { size: flipSize,
+                      isLong: fillIsLong,
+                      entryPrice: fillPrice as Uint<64>,
+                      entryQuote: flipQuote,
+                      lastFundingIndex: st.fundingIndex,
+                      lastFundingIsNeg: st.fundingIsNeg, };
+  }
+}
+
+circuit hashRegisterIntent(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          clawbackAuthHash: Bytes<32>,
+          cap: Uint<128>,
+          expiresAt: Uint<64>,
+          userPkX: Field,
+          userPkY: Field,
+          nonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<10, Bytes<32>>>(
+           [pad(32, "ascend:perps:register"),
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            clawbackAuthHash,
+            cap as Bytes<32>,
+            expiresAt as Bytes<32>,
+            userPkX as Bytes<32>,
+            userPkY as Bytes<32>,
+            nonce as Bytes<32>,]
+           );
+}
+
+circuit hashEscrowBindingForReceipt(
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          clawbackAuthHash: Bytes<32>,
+          cap: Uint<128>,
+          expiresAt: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<6, Bytes<32>>>(
+           [pad(32, "ascend:bridge:escrowbinding"),
+            chainId as Bytes<32>,
+            escrowRef,
+            clawbackAuthHash,
+            cap as Bytes<32>,
+            expiresAt as Bytes<32>,]
+           );
+}
+
+circuit hashBindReceipt(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowBindingHash: Bytes<32>,
+          expiresAt: Uint<64>,
+          receiptNonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<6, Bytes<32>>>(
+           [pad(32, "ascend:bridge:bind"),
+            accountId,
+            chainId as Bytes<32>,
+            escrowBindingHash,
+            expiresAt as Bytes<32>,
+            receiptNonce as Bytes<32>,]
+           );
+}
+
+circuit hashCreateOrderOp(
+          accountId: Bytes<32>,
+          marketIndex: Uint<16>,
+          price: Uint<32>,
+          size: Uint<64>,
+          isAsk: Boolean,
+          orderType: Uint<8>,
+          nonce: Uint<64>,
+          orderExpiresAt: Uint<64>,
+          ): Bytes<32> {
+  const isAskU: Uint<8> = isAsk ? 1 as Uint<8> : 0 as Uint<8>;
+  return persistentHash<Vector<9, Bytes<32>>>(
+           [pad(32, "ascend:perps:createOrder"),
+            accountId,
+            marketIndex as Bytes<32>,
+            price as Bytes<32>,
+            size as Bytes<32>,
+            isAskU as Bytes<32>,
+            orderType as Bytes<32>,
+            nonce as Bytes<32>,
+            orderExpiresAt as Bytes<32>,]
+           );
+}
+
+circuit hashCancelOrderOp(accountId: Bytes<32>, nonce: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:perps:cancelOrder"), accountId, nonce as Bytes<32>,]
+           );
+}
+
+export ledger governorPk: Bytes<32>;
+
+export ledger sequencerPk: Bytes<32>;
+
+export ledger attestorPk: VerifierKey;
+
+export ledger pendingAttestorPk: PendingKey;
+
+export ledger pendingAttestorActive: Boolean;
+
+export ledger accountKeys: Map<Bytes<32>, VerifierKey>;
+
+export ledger escrowMirror: Map<Bytes<32>, EscrowMirror>;
+
+export ledger markets: Map<Uint<16>, MarketConfig>;
+
+export ledger marketStates: Map<Uint<16>, MarketState>;
+
+export ledger positions: Map<Bytes<32>, Position>;
+
+export ledger orders: Map<Bytes<32>, Order>;
+
+export ledger userNonceHwm: Map<Bytes<32>, Uint<64>>;
+
+export ledger attestorReceiptHwm: Map<Bytes<32>, Uint<64>>;
+
+export ledger openOrders: Map<Bytes<32>, Uint<32>>;
+
+export ledger pausedTrading: Boolean;
+
+constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field,) {
+  assert(initGovPk != pad(32, ""), "governor pk zero");
+  assert(initSeqPk != pad(32, ""), "sequencer pk zero");
+  assert(initAttestorX != 0 || initAttestorY != 0, "attestor pk zero");
+  governorPk = disclose(initGovPk);
+  sequencerPk = disclose(initSeqPk);
+  attestorPk = disclose(VerifierKey { x: initAttestorX, y: initAttestorY });
+  pendingAttestorActive = disclose(false);
+  pausedTrading = disclose(false);
+}
+
+export circuit registerAccount(
+                 accountId: Bytes<32>,
+                 chainId: Uint<8>,
+                 escrowRef: Bytes<32>,
+                 clawbackAuthHash: Bytes<32>,
+                 cap: Uint<128>,
+                 expiresAt: Uint<64>,
+                 nonce: Uint<64>,
+                 userPkX: Field,
+                 userPkY: Field,
+                 userSig: SchnorrSignature,
+                 receiptNonce: Uint<64>,
+                 attestorSig: SchnorrSignature,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedTrading, "Trading paused");
+
+  const dAccountId = disclose(accountId);
+  const dChain = disclose(chainId);
+  const dPkX = disclose(userPkX);
+  const dPkY = disclose(userPkY);
+  assert(dPkX != 0 || dPkY != 0, "user pk zero");
+
+  const dNonce = disclose(nonce);
+  assertAndBumpHwm(pad(32, "trading:user-reg"), dAccountId, dNonce);
+
+  if (accountKeys.member(dAccountId)) {
+    const existing = accountKeys.lookup(dAccountId);
+    assert(existing.x == dPkX, "Account key x mismatch");
+    assert(existing.y == dPkY, "Account key y mismatch");
+  } else {
+    accountKeys.insert(dAccountId, VerifierKey { x: dPkX, y: dPkY });
+  }
+
+  const userKey = VerifierKey { x: dPkX, y: dPkY };
+  const userMsg = degradeToTransient(
+                    hashRegisterIntent(
+                      dAccountId,
+                      dChain,
+                      disclose(escrowRef),
+                      disclose(clawbackAuthHash),
+                      disclose(cap),
+                      disclose(expiresAt),
+                      dPkX,
+                      dPkY,
+                      dNonce,
+                      )
+                    );
+  verifySchnorr(userSig, userKey, userMsg);
+
+  const escrowBindingHash =
+          disclose(hashEscrowBindingForReceipt(
+                     dChain,
+                     disclose(escrowRef),
+                     disclose(clawbackAuthHash),
+                     disclose(cap),
+                     disclose(expiresAt),
+                     ));
+
+  const dReceiptNonce = disclose(receiptNonce);
+  assertAndBumpReceiptHwm(dAccountId, dReceiptNonce);
+
+  const receiptHash =
+          hashBindReceipt(
+            dAccountId,
+            dChain,
+            escrowBindingHash,
+            disclose(expiresAt),
+            dReceiptNonce,
+            );
+  verifySchnorr(attestorSig, attestorPk, degradeToTransient(receiptHash));
+
+  escrowMirror.insert(
+    dAccountId,
+    disclose(EscrowMirror { chainId: chainId,
+                            escrowBindingHash: escrowBindingHash,
+                            expiresAt: expiresAt, })
+    );
+}
+
+export circuit refreshEscrowMirror(
+                 accountId: Bytes<32>,
+                 chainId: Uint<8>,
+                 escrowBindingHash: Bytes<32>,
+                 expiresAt: Uint<64>,
+                 receiptNonce: Uint<64>,
+                 attestorSig: SchnorrSignature,
+                 ): [] {
+  requireSequencer();
+  const dAccountId = disclose(accountId);
+  assert(accountKeys.member(dAccountId), "Account not registered");
+
+  const dReceiptNonce = disclose(receiptNonce);
+  assertAndBumpReceiptHwm(dAccountId, dReceiptNonce);
+
+  const receiptHash =
+          hashBindReceipt(
+            dAccountId,
+            disclose(chainId),
+            disclose(escrowBindingHash),
+            disclose(expiresAt),
+            dReceiptNonce,
+            );
+  verifySchnorr(attestorSig, attestorPk, degradeToTransient(receiptHash));
+
+  escrowMirror.insert(
+    dAccountId,
+    disclose(EscrowMirror { chainId: chainId,
+                            escrowBindingHash: escrowBindingHash,
+                            expiresAt: expiresAt, })
+    );
+}
+
+export circuit syncMarket(
+                 marketIndex: Uint<16>,
+                 status: Uint<8>,
+                 takerFee: Uint<32>,
+                 makerFee: Uint<32>,
+                 liquidationFee: Uint<32>,
+                 defaultIMF: Uint<16>,
+                 minIMF: Uint<16>,
+                 maintenanceMF: Uint<16>,
+                 closeOutMF: Uint<16>,
+                 quoteMultiplier: Uint<32>,
+                 interestRate: Uint<32>,
+                 fundingClampSmall: Uint<32>,
+                 fundingClampBig: Uint<32>,
+                 openInterestLimit: Uint<64>,
+                 minBaseAmount: Uint<64>,
+                 markPrice: Uint<32>,
+                 indexPrice: Uint<32>,
+                 ): [] {
+  requireGovernor();
+  const dIdx = disclose(marketIndex);
+  markets.insert(
+    dIdx,
+    disclose(MarketConfig { marketIndex: marketIndex,
+                            status: status,
+                            takerFee: takerFee,
+                            makerFee: makerFee,
+                            liquidationFee: liquidationFee,
+                            defaultIMF: defaultIMF,
+                            minIMF: minIMF,
+                            maintenanceMF: maintenanceMF,
+                            closeOutMF: closeOutMF,
+                            quoteMultiplier: quoteMultiplier,
+                            interestRate: interestRate,
+                            fundingClampSmall: fundingClampSmall,
+                            fundingClampBig: fundingClampBig,
+                            openInterestLimit: openInterestLimit,
+                            minBaseAmount: minBaseAmount, })
+    );
+  const dMark = disclose(markPrice);
+  const dIndex = disclose(indexPrice);
+  assert(dMark >= 1, "Mark price too low");
+  assert(dIndex >= 1, "Index price too low");
+  if (marketStates.member(dIdx)) {
+    const st = marketStates.lookup(dIdx);
+    marketStates.insert(
+      dIdx,
+      disclose(MarketState { markPrice: markPrice,
+                             indexPrice: indexPrice,
+                             openInterest: st.openInterest,
+                             fundingIndex: st.fundingIndex,
+                             fundingIsNeg: st.fundingIsNeg,
+                             lastFundingTs: st.lastFundingTs,
+                             totalVolume: st.totalVolume, })
+      );
+  } else {
+    marketStates.insert(
+      dIdx,
+      disclose(MarketState { markPrice: markPrice,
+                             indexPrice: indexPrice,
+                             openInterest: 0 as Uint<64>,
+                             fundingIndex: 0 as Uint<128>,
+                             fundingIsNeg: false,
+                             lastFundingTs: 0 as Uint<64>,
+                             totalVolume: 0 as Uint<128>, })
+      );
+  }
+}
+
+export circuit createOrder(
+                 accountId: Bytes<32>,
+                 marketIndex: Uint<16>,
+                 price: Uint<32>,
+                 size: Uint<64>,
+                 isAsk: Boolean,
+                 orderType: Uint<8>,
+                 nonce: Uint<64>,
+                 orderExpiresAt: Uint<64>,
+                 userSig: SchnorrSignature,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedTrading, "Trading paused");
+
+  const dAccountId = disclose(accountId);
+  const dIdx = disclose(marketIndex);
+  assert(markets.member(dIdx), "Market not found");
+  const cfg = markets.lookup(dIdx);
+  assert(cfg.status == 1, "Market not active");
+
+  assert(accountKeys.member(dAccountId), "Account has no registered key");
+  assert(escrowMirror.member(dAccountId), "No escrow binding mirrored");
+  const mirror = escrowMirror.lookup(dAccountId);
+  const nowTs = nowBounded();
+  assert(nowTs < mirror.expiresAt, "Escrow binding expired");
+
+  const dExp = disclose(orderExpiresAt);
+  assert(dExp > nowTs, "orderExpiresAt must be in the future");
+  assert(dExp <= mirror.expiresAt, "orderExpiresAt exceeds escrow window");
+
+  const userKey = accountKeys.lookup(dAccountId);
+  const msgHash = degradeToTransient(
+                    hashCreateOrderOp(
+                      dAccountId,
+                      dIdx,
+                      disclose(price),
+                      disclose(size),
+                      disclose(isAsk),
+                      disclose(orderType),
+                      disclose(nonce),
+                      dExp,
+                      )
+                    );
+  verifySchnorr(userSig, userKey, msgHash);
+
+  const dSize = disclose(size);
+  assert(dSize >= cfg.minBaseAmount, "Size below minimum");
+  const dPrice = disclose(price);
+  assert(dPrice >= 1, "Price must be positive");
+
+  assertAndBumpHwm(pad(32, "trading:user"), dAccountId, disclose(nonce));
+
+  const currentOpen = openOrders.member(dAccountId) ? openOrders.lookup(dAccountId) : 0 as Uint<32>;
+  assert(currentOpen < 64 as Uint<32>, "Open-order cap exceeded (64 per account)");
+  openOrders.insert(dAccountId, disclose((currentOpen + 1) as Uint<32>));
+
+  const ok = disclose(orderKey(dAccountId, nonce));
+  orders.insert(
+    ok,
+    disclose(Order { accountId: accountId,
+                     marketIndex: marketIndex,
+                     price: price,
+                     size: size,
+                     remainingSize: size,
+                     isAsk: isAsk,
+                     orderType: orderType,
+                     expiresAt: orderExpiresAt, })
+    );
+}
+
+export circuit cancelOrder(accountId: Bytes<32>, nonce: Uint<64>, userSig: SchnorrSignature,): [] {
+  requireSequencer();
+
+  const dAccountId = disclose(accountId);
+  assert(accountKeys.member(dAccountId), "Account has no registered key");
+  const userKey = accountKeys.lookup(dAccountId);
+  const msgHash = degradeToTransient(hashCancelOrderOp(dAccountId, disclose(nonce)));
+  verifySchnorr(userSig, userKey, msgHash);
+
+  const ok = disclose(orderKey(dAccountId, nonce));
+  assert(orders.member(ok), "Order not found");
+  const order = orders.lookup(ok);
+  assert(order.accountId == dAccountId, "Not order owner");
+
+  const currentOpen = openOrders.member(dAccountId) ? openOrders.lookup(dAccountId) : 0 as Uint<32>;
+  assert(currentOpen >= 1 as Uint<32>, "openOrders counter underflow");
+  openOrders.insert(dAccountId, disclose((currentOpen - 1) as Uint<32>));
+
+  orders.remove(ok);
+}
+
+export circuit executeTrade(
+                 takerAccountId: Bytes<32>,
+                 takerOrderNonce: Uint<64>,
+                 makerAccountId: Bytes<32>,
+                 makerOrderNonce: Uint<64>,
+                 marketIndex: Uint<16>,
+                 fillSize: Uint<64>,
+                 fillPrice: Uint<32>,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedTrading, "Trading paused");
+
+  const dIdx = disclose(marketIndex);
+  assert(markets.member(dIdx), "Market not found");
+  const cfg = markets.lookup(dIdx);
+  assert(cfg.status == 1, "Market not active");
+  const st = marketStates.lookup(dIdx);
+
+  const dFillSize = disclose(fillSize);
+  const dFillPrice = disclose(fillPrice);
+  assert(dFillSize >= cfg.minBaseAmount, "Fill below minimum");
+  assert(dFillPrice >= 1, "Price must be positive");
+
+  const dTaker = disclose(takerAccountId);
+  const dMaker = disclose(makerAccountId);
+  const dTakerNonce = disclose(takerOrderNonce);
+  const dMakerNonce = disclose(makerOrderNonce);
+
+  const takerOrderK = disclose(orderKey(dTaker, dTakerNonce));
+  const makerOrderK = disclose(orderKey(dMaker, dMakerNonce));
+  assert(orders.member(takerOrderK), "Taker order not found");
+  assert(orders.member(makerOrderK), "Maker order not found");
+  const takerOrder = orders.lookup(takerOrderK);
+  const makerOrder = orders.lookup(makerOrderK);
+  assert(takerOrder.accountId == dTaker, "Taker order ownership mismatch");
+  assert(makerOrder.accountId == dMaker, "Maker order ownership mismatch");
+  assert(takerOrder.marketIndex == marketIndex, "Taker market mismatch");
+  assert(makerOrder.marketIndex == marketIndex, "Maker market mismatch");
+  assert(takerOrder.isAsk != makerOrder.isAsk, "Same-side fill");
+  assert(takerOrder.remainingSize >= fillSize, "Taker insufficient remaining");
+  assert(makerOrder.remainingSize >= fillSize, "Maker insufficient remaining");
+
+  const nowTs = nowBounded();
+  assert(nowTs < takerOrder.expiresAt, "Taker order expired");
+  assert(nowTs < makerOrder.expiresAt, "Maker order expired");
+
+  assert(escrowMirror.member(dTaker), "Taker has no escrow mirror");
+  assert(escrowMirror.member(dMaker), "Maker has no escrow mirror");
+  const takerMirror = escrowMirror.lookup(dTaker);
+  const makerMirror = escrowMirror.lookup(dMaker);
+  assert(nowTs < takerMirror.expiresAt, "Taker escrow binding expired");
+  assert(nowTs < makerMirror.expiresAt, "Maker escrow binding expired");
+  assert(dFillPrice == makerOrder.price, "Fill price must equal maker price");
+  if (takerOrder.isAsk) {
+    assert(makerOrder.price >= takerOrder.price, "Taker ask not crossed");
+  } else {
+    assert(makerOrder.price <= takerOrder.price, "Taker bid not crossed");
+  }
+
+  const newTakerRemaining = (takerOrder.remainingSize - dFillSize) as Uint<64>;
+  const newMakerRemaining = (makerOrder.remainingSize - dFillSize) as Uint<64>;
+
+  if (newTakerRemaining == 0 as Uint<64>) {
+    orders.remove(takerOrderK);
+    const takerOpen = openOrders.member(dTaker) ? openOrders.lookup(dTaker) : 0 as Uint<32>;
+    assert(takerOpen >= 1 as Uint<32>, "taker openOrders underflow");
+    openOrders.insert(dTaker, disclose((takerOpen - 1) as Uint<32>));
+  } else {
+    orders.insert(
+      takerOrderK,
+      disclose(Order { accountId: takerOrder.accountId,
+                       marketIndex: takerOrder.marketIndex,
+                       price: takerOrder.price,
+                       size: takerOrder.size,
+                       remainingSize: newTakerRemaining,
+                       isAsk: takerOrder.isAsk,
+                       orderType: takerOrder.orderType,
+                       expiresAt: takerOrder.expiresAt, })
+      );
+  }
+
+  if (newMakerRemaining == 0 as Uint<64>) {
+    orders.remove(makerOrderK);
+    const makerOpen = openOrders.member(dMaker) ? openOrders.lookup(dMaker) : 0 as Uint<32>;
+    assert(makerOpen >= 1 as Uint<32>, "maker openOrders underflow");
+    openOrders.insert(dMaker, disclose((makerOpen - 1) as Uint<32>));
+  } else {
+    orders.insert(
+      makerOrderK,
+      disclose(Order { accountId: makerOrder.accountId,
+                       marketIndex: makerOrder.marketIndex,
+                       price: makerOrder.price,
+                       size: makerOrder.size,
+                       remainingSize: newMakerRemaining,
+                       isAsk: makerOrder.isAsk,
+                       orderType: makerOrder.orderType,
+                       expiresAt: makerOrder.expiresAt, })
+      );
+  }
+
+  const takerIsLong = !takerOrder.isAsk;
+  const makerIsLong = !makerOrder.isAsk;
+
+  const takerPosKey = disclose(positionKey(dTaker, dIdx));
+  const oldTaker =
+          positions.member(takerPosKey)
+            ? positions.lookup(takerPosKey)
+            : Position { size: 0 as Uint<64>,
+                         isLong: false,
+                         entryPrice: 0 as Uint<64>,
+                         entryQuote: 0 as Uint<128>,
+                         lastFundingIndex: 0 as Uint<128>,
+                         lastFundingIsNeg: false, };
+  const newTaker = applyFillToPosition(oldTaker, dFillSize, dFillPrice, takerIsLong, st);
+  if (disclose(newTaker.size == 0 as Uint<64>)) {
+    if (positions.member(takerPosKey)) {
+      positions.remove(takerPosKey);
+    }
+  } else {
+    positions.insert(takerPosKey, disclose(newTaker));
+  }
+
+  const makerPosKey = disclose(positionKey(dMaker, dIdx));
+  const oldMaker =
+          positions.member(makerPosKey)
+            ? positions.lookup(makerPosKey)
+            : Position { size: 0 as Uint<64>,
+                         isLong: false,
+                         entryPrice: 0 as Uint<64>,
+                         entryQuote: 0 as Uint<128>,
+                         lastFundingIndex: 0 as Uint<128>,
+                         lastFundingIsNeg: false, };
+  const newMaker = applyFillToPosition(oldMaker, dFillSize, dFillPrice, makerIsLong, st);
+  if (disclose(newMaker.size == 0 as Uint<64>)) {
+    if (positions.member(makerPosKey)) {
+      positions.remove(makerPosKey);
+    }
+  } else {
+    positions.insert(makerPosKey, disclose(newMaker));
+  }
+
+  const oldTakerLong = oldTaker.isLong ? oldTaker.size : 0 as Uint<64>;
+  const newTakerLong = newTaker.isLong ? newTaker.size : 0 as Uint<64>;
+  const oldMakerLong = oldMaker.isLong ? oldMaker.size : 0 as Uint<64>;
+  const newMakerLong = newMaker.isLong ? newMaker.size : 0 as Uint<64>;
+  const takerLongUp =
+          newTakerLong >= oldTakerLong ? (newTakerLong - oldTakerLong) as Uint<64> : 0 as Uint<64>;
+  const takerLongDown =
+          oldTakerLong >= newTakerLong ? (oldTakerLong - newTakerLong) as Uint<64> : 0 as Uint<64>;
+  const makerLongUp =
+          newMakerLong >= oldMakerLong ? (newMakerLong - oldMakerLong) as Uint<64> : 0 as Uint<64>;
+  const makerLongDown =
+          oldMakerLong >= newMakerLong ? (oldMakerLong - newMakerLong) as Uint<64> : 0 as Uint<64>;
+  const oiAfterUp = (st.openInterest + takerLongUp + makerLongUp) as Uint<64>;
+  const oiDown = (takerLongDown + makerLongDown) as Uint<64>;
+  const newOi = oiAfterUp >= oiDown ? (oiAfterUp - oiDown) as Uint<64> : 0 as Uint<64>;
+
+  assert(newOi <= cfg.openInterestLimit, "OI cap exceeded");
+
+  const tradeQuote = notionalQuote(dFillSize, dFillPrice);
+  marketStates.insert(
+    dIdx,
+    disclose(MarketState { markPrice: st.markPrice,
+                           indexPrice: st.indexPrice,
+                           openInterest: newOi,
+                           fundingIndex: st.fundingIndex,
+                           fundingIsNeg: st.fundingIsNeg,
+                           lastFundingTs: st.lastFundingTs,
+                           totalVolume: (st.totalVolume + tradeQuote) as Uint<128>, })
+    );
+}
+
+export circuit pruneOrder(accountId: Bytes<32>, orderNonce: Uint<64>,): [] {
+  requireSequencer();
+
+  const dAccountId = disclose(accountId);
+  const dOrderNonce = disclose(orderNonce);
+
+  const ok = disclose(orderKey(dAccountId, dOrderNonce));
+  assert(orders.member(ok), "Order not found");
+  const order = orders.lookup(ok);
+  assert(order.accountId == dAccountId, "Not order owner");
+
+  const nowTs = nowBounded();
+  assert(order.expiresAt <= nowTs, "Order not yet expired");
+
+  const currentOpen = openOrders.member(dAccountId) ? openOrders.lookup(dAccountId) : 0 as Uint<32>;
+  assert(currentOpen >= 1 as Uint<32>, "openOrders counter underflow");
+  openOrders.insert(dAccountId, disclose((currentOpen - 1) as Uint<32>));
+
+  orders.remove(ok);
+}
+
+export circuit setPausedTrading(p: Boolean): [] {
+  requireGovernor();
+  pausedTrading = disclose(p);
+}
+
+export circuit proposeAttestorKey(newX: Field, newY: Field): [] {
+  requireGovernor();
+  assert(newX != 0 || newY != 0, "attestor pk zero");
+  const nowTs = nowBounded();
+  pendingAttestorPk =
+    disclose(PendingKey { x: newX, y: newY, effective: (nowTs + 86400 as Uint<64>) as Uint<64>, });
+  pendingAttestorActive = disclose(true);
+}
+
+export circuit activateAttestorKey(): [] {
+  requireGovernor();
+  assert(pendingAttestorActive, "No pending attestor key");
+  assert(blockTimeGte(pendingAttestorPk.effective), "Timelock not elapsed");
+  attestorPk = VerifierKey { x: pendingAttestorPk.x, y: pendingAttestorPk.y };
+  pendingAttestorActive = disclose(false);
+}
