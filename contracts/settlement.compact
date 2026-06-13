@@ -1,4 +1,4 @@
-pragma language_version >= 0.22;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 
@@ -34,6 +34,9 @@ struct ChainConfig {
   chainId: Uint<8>;
   enabled: Boolean;
   certDomain: Bytes<32>;
+  sourceContractId: Bytes<32>;
+  targetChainId: Uint<8>;
+  targetContractId: Bytes<32>;
 }
 
 struct LossCertHeader {
@@ -49,6 +52,7 @@ struct SettlementCertHeader {
   chainId: Uint<8>;
   escrowRef: Bytes<32>;
   withdrawAmount: Uint<128>;
+  recipientHash: Bytes<32>;
   certNonce: Uint<64>;
 }
 
@@ -63,8 +67,6 @@ struct EscrowBinding {
 witness sequencerSecret(): Maybe<Bytes<32>>;
 
 witness governorSecret(): Maybe<Bytes<32>>;
-
-witness jubjubFrModulusWitness(): Field;
 
 witness currentTime(): Uint<64>;
 
@@ -93,7 +95,7 @@ circuit requireGovernor(): [] {
 }
 
 circuit jubjubFrModulus(): Field {
-  return disclose(jubjubFrModulusWitness());
+  return 6554484396890773809930967563523245729705921265872317281365359162392183254199 as Field;
 }
 
 circuit nowBounded(): Uint<64> {
@@ -128,15 +130,62 @@ circuit assertAndBumpUserHwm(scopeTag: Bytes<32>, accountId: Bytes<32>, nonce: U
   userNonceHwm.insert(key, nonce);
 }
 
-circuit assertAndBumpCertHwm(accountId: Bytes<32>, certNonce: Uint<64>): [] {
-  const current = certNonceHwm.member(accountId) ? certNonceHwm.lookup(accountId) : 0 as Uint<64>;
+circuit accountIdForUserKey(userPkX: Field, userPkY: Field): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:account:v1"), userPkX as Bytes<32>, userPkY as Bytes<32>,]
+           );
+}
+
+circuit assertAndBumpCertHwm(key: Bytes<32>, certNonce: Uint<64>): [] {
+  const current = certNonceHwm.member(key) ? certNonceHwm.lookup(key) : 0 as Uint<64>;
   assert(certNonce > current, "Cert nonce must be strictly increasing");
-  certNonceHwm.insert(accountId, certNonce);
+  certNonceHwm.insert(key, certNonce);
 }
 
 circuit bindingKey(accountId: Bytes<32>, chainId: Uint<8>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>(
            [pad(32, "ascend:binding"), accountId, chainId as Bytes<32>,]
+           );
+}
+
+circuit escrowLifecycleKey(chainId: Uint<8>, escrowRef: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:escrow-status"), chainId as Bytes<32>, escrowRef,]
+           );
+}
+
+circuit terminalCertNonceKey(domain: Bytes<32>, escrowRef: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:cert-nonce"), domain, escrowRef,]
+           );
+}
+
+circuit terminalCertNullifierKey(domain: Bytes<32>, escrowRef: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:terminal-nullifier"), domain, escrowRef,]
+           );
+}
+
+circuit statusRegistered(): Uint<8> {
+  return 1 as Uint<8>;
+}
+
+circuit statusActivated(): Uint<8> {
+  return 2 as Uint<8>;
+}
+
+circuit statusConsumed(): Uint<8> {
+  return 3 as Uint<8>;
+}
+
+circuit escrowStateKey(
+          scopeTag: Bytes<32>,
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          ): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+           [scopeTag, accountId, chainId as Bytes<32>, escrowRef,]
            );
 }
 
@@ -146,27 +195,71 @@ circuit pendingKeyKey(chainId: Uint<8>, slotId: Uint<8>): Bytes<32> {
            );
 }
 
-circuit assertSlotNonZero(k: VerifierKey, idx: Uint<8>): [] {
-  if (idx == 0 as Uint<8>) {
-    assert(k.x != 0 || k.y != 0, "slot 0 zero");
-  } else if (idx == 1 as Uint<8>) {
-    assert(k.x != 0 || k.y != 0, "slot 1 zero");
-  } else if (idx == 2 as Uint<8>) {
-    assert(k.x != 0 || k.y != 0, "slot 2 zero");
-  } else if (idx == 3 as Uint<8>) {
-    assert(k.x != 0 || k.y != 0, "slot 3 zero");
-  } else {
-    assert(k.x != 0 || k.y != 0, "slot 4 zero");
-  }
+circuit assertSupportedSourceChain(chainId: Uint<8>): [] {
+  assert(chainId == 1 as Uint<8> || chainId == 2 as Uint<8> || chainId == 3 as Uint<8>, "Unsupported source chain");
+}
+
+circuit protocolId(): Bytes<32> {
+  return pad(32, "ascend:perps:v2");
+}
+
+circuit hashDomainTupleV2(
+          domainBridgeDeploymentId: Bytes<32>,
+          sourceChainId: Uint<8>,
+          sourceContractId: Bytes<32>,
+          targetChainId: Uint<8>,
+          targetContractId: Bytes<32>,
+          committeeEpoch: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(
+           [pad(32, "ascend:domain-tuple:v2"),
+            protocolId(),
+            domainBridgeDeploymentId,
+            sourceChainId as Bytes<32>,
+            sourceContractId,
+            targetChainId as Bytes<32>,
+            targetContractId,
+            committeeEpoch as Bytes<32>,]
+           );
+}
+
+circuit currentCommitteeEpoch(chainId: Uint<8>): Uint<64> {
+  assert(committeeEpochs.member(chainId), "Committee epoch missing");
+  const epoch = committeeEpochs.lookup(chainId);
+  assert(epoch > 0 as Uint<64>, "Committee epoch must be positive");
+  return epoch;
+}
+
+circuit assertChainDomainCurrent(chainId: Uint<8>, cfg: ChainConfig): Bytes<32> {
+  assert(cfg.chainId == chainId, "Chain config id mismatch");
+  assert(cfg.sourceContractId != pad(32, ""), "source contract id missing");
+  assert(cfg.targetContractId != pad(32, ""), "target contract id missing");
+  const epoch = currentCommitteeEpoch(chainId);
+  const expectedDomain =
+          disclose(hashDomainTupleV2(
+                     bridgeDeploymentId,
+                     chainId,
+                     cfg.sourceContractId,
+                     cfg.targetChainId,
+                     cfg.targetContractId,
+                     epoch,
+                     ));
+  assert(cfg.certDomain == expectedDomain, "Chain domain mismatch");
+  return expectedDomain;
+}
+
+circuit assertSlotNonZero(k: VerifierKey): [] {
+  assert(k.x != 0 || k.y != 0, "committee slot zero");
 }
 
 circuit assertCommitteeDistinct(c: CommitteeKeys): [] {
 
-  assertSlotNonZero(c.slot0, 0 as Uint<8>);
-  assertSlotNonZero(c.slot1, 1 as Uint<8>);
-  assertSlotNonZero(c.slot2, 2 as Uint<8>);
-  assertSlotNonZero(c.slot3, 3 as Uint<8>);
-  assertSlotNonZero(c.slot4, 4 as Uint<8>);
+  assert(c.slotCount == 5 as Uint<8>, "committee slot count must be 5");
+  assertSlotNonZero(c.slot0);
+  assertSlotNonZero(c.slot1);
+  assertSlotNonZero(c.slot2);
+  assertSlotNonZero(c.slot3);
+  assertSlotNonZero(c.slot4);
 
   assert(!(c.slot0.x == c.slot1.x && c.slot0.y == c.slot1.y), "slots 0,1 equal");
   assert(!(c.slot0.x == c.slot2.x && c.slot0.y == c.slot2.y), "slots 0,2 equal");
@@ -214,6 +307,7 @@ circuit verifyCommitteeQuorum(
 }
 
 circuit hashRegisterIntent(
+          bridgeDeploymentId: Bytes<32>,
           accountId: Bytes<32>,
           chainId: Uint<8>,
           escrowRef: Bytes<32>,
@@ -224,8 +318,9 @@ circuit hashRegisterIntent(
           userPkY: Field,
           nonce: Uint<64>,
           ): Bytes<32> {
-  return persistentHash<Vector<10, Bytes<32>>>(
+  return persistentHash<Vector<11, Bytes<32>>>(
            [pad(32, "ascend:perps:register"),
+            bridgeDeploymentId,
             accountId,
             chainId as Bytes<32>,
             escrowRef,
@@ -235,6 +330,50 @@ circuit hashRegisterIntent(
             userPkX as Bytes<32>,
             userPkY as Bytes<32>,
             nonce as Bytes<32>,]
+           );
+}
+
+circuit hashEscrowBindingAttestation(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          clawbackAuthHash: Bytes<32>,
+          cap: Uint<128>,
+          expiresAt: Uint<64>,
+          bridgeEvidenceHash: Bytes<32>,
+          chainDomain: Bytes<32>,
+          bridgeDeploymentId: Bytes<32>,
+          ): Bytes<32> {
+  return persistentHash<Vector<10, Bytes<32>>>(
+           [pad(32, "ascend:escrow:binding:v1"),
+            bridgeDeploymentId,
+            chainDomain,
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            clawbackAuthHash,
+            cap as Bytes<32>,
+            expiresAt as Bytes<32>,
+            bridgeEvidenceHash,]
+           );
+}
+
+circuit hashEscrowActivationAttestation(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          terminalEvidenceHash: Bytes<32>,
+          chainDomain: Bytes<32>,
+          bridgeDeploymentId: Bytes<32>,
+          ): Bytes<32> {
+  return persistentHash<Vector<7, Bytes<32>>>(
+           [pad(32, "ascend:escrow:activate:v1"),
+            bridgeDeploymentId,
+            chainDomain,
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            terminalEvidenceHash,]
            );
 }
 
@@ -261,31 +400,55 @@ circuit hashAttestBatch(
            );
 }
 
-circuit hashLossCert(h: LossCertHeader, domain: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<6, Bytes<32>>>(
+circuit hashLossCert(h: LossCertHeader, domain: Bytes<32>, stateRootAtIssue: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<7, Bytes<32>>>(
            [domain,
             h.accountId,
             h.chainId as Bytes<32>,
             h.escrowRef,
             h.lossAmount as Bytes<32>,
-            h.certNonce as Bytes<32>,]
+            h.certNonce as Bytes<32>,
+            stateRootAtIssue,]
            );
 }
 
-circuit hashSettlementCert(h: SettlementCertHeader, domain: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<6, Bytes<32>>>(
+circuit hashSettlementCert(h: SettlementCertHeader, domain: Bytes<32>, stateRootAtIssue: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(
            [domain,
             h.accountId,
             h.chainId as Bytes<32>,
             h.escrowRef,
             h.withdrawAmount as Bytes<32>,
-            h.certNonce as Bytes<32>,]
+            h.recipientHash,
+            h.certNonce as Bytes<32>,
+            stateRootAtIssue,]
            );
 }
 
-export ledger governorPk: Bytes<32>;
+circuit hashSettlementArchive(
+          prevArchiveRoot: Bytes<32>,
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          status: Uint<8>,
+          clawbackAmount: Uint<128>,
+          settlementAmount: Uint<128>,
+          ): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(
+           [pad(32, "ascend:settlement-archive:v1"),
+            prevArchiveRoot,
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            status as Bytes<32>,
+            clawbackAmount as Bytes<32>,
+            settlementAmount as Bytes<32>,]
+           );
+}
 
-export ledger sequencerPk: Bytes<32>;
+export sealed ledger governorPk: Bytes<32>;
+
+export sealed ledger sequencerPk: Bytes<32>;
 
 export ledger attestorPk: VerifierKey;
 
@@ -294,6 +457,18 @@ export ledger pendingAttestorPk: PendingKey;
 export ledger pendingAttestorActive: Boolean;
 
 export ledger escrowBindings: Map<Bytes<32>, EscrowBinding>;
+
+export ledger registeredEscrows: Map<Bytes<32>, Boolean>;
+
+export ledger activatedEscrows: Map<Bytes<32>, Boolean>;
+
+export ledger consumedEscrows: Map<Bytes<32>, Boolean>;
+
+export ledger escrowStatuses: Map<Bytes<32>, Uint<8>>;
+
+export ledger terminalCertNullifiers: Map<Bytes<32>, Boolean>;
+
+export ledger escrowTerminalDomains: Map<Bytes<32>, Bytes<32>>;
 
 export ledger issuedClawback: Map<Bytes<32>, Uint<128>>;
 
@@ -307,6 +482,8 @@ export ledger pendingCommitteeKeys: Map<Bytes<32>, PendingKey>;
 
 export ledger pendingRotationChain: Map<Uint<8>, Boolean>;
 
+export ledger committeeEpochs: Map<Uint<8>, Uint<64>>;
+
 export ledger attestedFillBatchRoot: Bytes<32>;
 
 export ledger positionsRoot: Bytes<32>;
@@ -314,6 +491,8 @@ export ledger positionsRoot: Bytes<32>;
 export ledger accountStateRoot: Bytes<32>;
 
 export ledger batchProofCommitment: Bytes<32>;
+
+export ledger settlementArchiveRoot: Bytes<32>;
 
 export ledger attestationCount: Uint<64>;
 
@@ -327,18 +506,22 @@ export ledger certNonceHwm: Map<Bytes<32>, Uint<64>>;
 
 export ledger pausedCerts: Boolean;
 
-constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field,) {
+export sealed ledger bridgeDeploymentId: Bytes<32>;
+
+constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field, initBridgeDeploymentId: Bytes<32>,) {
   assert(initGovPk != pad(32, ""), "governor pk zero");
   assert(initSeqPk != pad(32, ""), "sequencer pk zero");
   assert(initAttestorX != 0 || initAttestorY != 0, "attestor pk zero");
+  assert(initBridgeDeploymentId != pad(32, ""), "bridge deployment id zero");
   governorPk = disclose(initGovPk);
   sequencerPk = disclose(initSeqPk);
   attestorPk = disclose(VerifierKey { x: initAttestorX, y: initAttestorY });
+  bridgeDeploymentId = disclose(initBridgeDeploymentId);
   attestedFillBatchRoot = disclose(pad(32, ""));
   positionsRoot = disclose(pad(32, ""));
-
   accountStateRoot = disclose(pad(32, ""));
   batchProofCommitment = disclose(pad(32, ""));
+  settlementArchiveRoot = disclose(pad(32, ""));
   attestationCount = disclose(0 as Uint<64>);
   issuedLossCertCount = disclose(0 as Uint<64>);
   issuedSettlementCertCount = disclose(0 as Uint<64>);
@@ -349,6 +532,9 @@ constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, in
 export circuit registerChain(
                  chainId: Uint<8>,
                  certDomain: Bytes<32>,
+                 sourceContractId: Bytes<32>,
+                 targetChainId: Uint<8>,
+                 targetContractId: Bytes<32>,
                  k0x: Field,
                  k0y: Field,
                  k1x: Field,
@@ -362,10 +548,32 @@ export circuit registerChain(
                  ): [] {
   requireGovernor();
   const dChain = disclose(chainId);
+  assertSupportedSourceChain(dChain);
+  assert(disclose(certDomain) != pad(32, ""), "cert domain required");
+  const dSourceContractId = disclose(sourceContractId);
+  const dTargetContractId = disclose(targetContractId);
+  assert(dSourceContractId != pad(32, ""), "source contract id required");
+  assert(dTargetContractId != pad(32, ""), "target contract id required");
+  const initialEpoch = 1 as Uint<64>;
+  const expectedDomain =
+          disclose(hashDomainTupleV2(
+                     bridgeDeploymentId,
+                     dChain,
+                     dSourceContractId,
+                     disclose(targetChainId),
+                     dTargetContractId,
+                     initialEpoch,
+                     ));
+  assert(disclose(certDomain) == expectedDomain, "domain does not match DomainTuple");
   assert(!chainConfigs.member(dChain), "Chain already registered");
   chainConfigs.insert(
     dChain,
-    disclose(ChainConfig { chainId: chainId, enabled: true, certDomain: certDomain, })
+    disclose(ChainConfig { chainId: chainId,
+                           enabled: true,
+                           certDomain: expectedDomain,
+                           sourceContractId: dSourceContractId,
+                           targetChainId: targetChainId,
+                           targetContractId: dTargetContractId, })
     );
   const newCommittee =
           CommitteeKeys { slot0: VerifierKey { x: k0x, y: k0y },
@@ -376,6 +584,7 @@ export circuit registerChain(
                           slotCount: 5 as Uint<8>, };
   assertCommitteeDistinct(newCommittee);
   committees.insert(dChain, disclose(newCommittee));
+  committeeEpochs.insert(dChain, disclose(initialEpoch));
 }
 
 export circuit proposeCommitteeKey(chainId: Uint<8>, slotId: Uint<8>, newX: Field, newY: Field,): [] {
@@ -441,6 +650,29 @@ export circuit activateCommitteeKey(chainId: Uint<8>, slotId: Uint<8>): [] {
                                                   slotCount: c.slotCount };
   assertCommitteeDistinct(updated);
   committees.insert(dChain, disclose(updated));
+  assert(chainConfigs.member(dChain), "Chain not registered");
+  const currentEpoch = currentCommitteeEpoch(dChain);
+  const nextEpoch = (currentEpoch + 1 as Uint<64>) as Uint<64>;
+  committeeEpochs.insert(dChain, disclose(nextEpoch));
+  const cfg = chainConfigs.lookup(dChain);
+  const nextDomain =
+          disclose(hashDomainTupleV2(
+                     bridgeDeploymentId,
+                     dChain,
+                     cfg.sourceContractId,
+                     cfg.targetChainId,
+                     cfg.targetContractId,
+                     nextEpoch,
+                     ));
+  chainConfigs.insert(
+    dChain,
+    disclose(ChainConfig { chainId: cfg.chainId,
+                           enabled: cfg.enabled,
+                           certDomain: nextDomain,
+                           sourceContractId: cfg.sourceContractId,
+                           targetChainId: cfg.targetChainId,
+                           targetContractId: cfg.targetContractId, })
+    );
   pendingRotationChain.insert(dChain, false);
 
   pendingCommitteeKeys.remove(key);
@@ -457,6 +689,8 @@ export circuit registerEscrowBinding(
                  userPkX: Field,
                  userPkY: Field,
                  userSig: SchnorrSignature,
+                 bridgeEvidenceHash: Bytes<32>,
+                 bridgeSigs: Vector<3, SchnorrSignature>,
                  ): [] {
   requireSequencer();
   assert(!pausedCerts, "Certs paused");
@@ -464,28 +698,46 @@ export circuit registerEscrowBinding(
   const dAccountId = disclose(accountId);
   const dChain = disclose(chainId);
   assert(chainConfigs.member(dChain), "Chain not registered");
+  const cfg = chainConfigs.lookup(dChain);
+  assert(cfg.enabled, "Chain disabled");
+  const chainDomain = assertChainDomainCurrent(dChain, cfg);
+  const committee = committees.lookup(dChain);
+  const dEscrowRef = disclose(escrowRef);
+  assert(dEscrowRef != pad(32, ""), "escrow ref required");
 
   const dPkX = disclose(userPkX);
   const dPkY = disclose(userPkY);
   assert(dPkX != 0 || dPkY != 0, "user pk zero");
+  assert(dAccountId == accountIdForUserKey(dPkX, dPkY), "accountId/user key mismatch");
 
   const dNonce = disclose(nonce);
   assertAndBumpUserHwm(pad(32, "settlement:user-reg"), dAccountId, dNonce);
 
   const dCap = disclose(cap);
+  assert(dCap > 0 as Uint<128>, "cap must be positive");
+  const dClawbackAuthHash = disclose(clawbackAuthHash);
+  assert(dClawbackAuthHash != pad(32, ""), "clawback auth hash required");
+  const dExpiresAt = disclose(expiresAt);
+  const dBridgeEvidenceHash = disclose(bridgeEvidenceHash);
+  assert(dBridgeEvidenceHash != pad(32, ""), "bridge evidence hash required");
+  const registerClawbackKey =
+          disclose(escrowStateKey(pad(32, "settlement:clawback"), dAccountId, dChain, dEscrowRef));
   const currentClawback =
-          issuedClawback.member(dAccountId) ? issuedClawback.lookup(dAccountId) : 0 as Uint<128>;
+          issuedClawback.member(registerClawbackKey)
+            ? issuedClawback.lookup(registerClawbackKey)
+            : 0 as Uint<128>;
   assert(dCap >= currentClawback, "cap below already-issued clawback");
 
   const userKey = VerifierKey { x: dPkX, y: dPkY };
   const userMsg = degradeToTransient(
                     hashRegisterIntent(
+                      bridgeDeploymentId,
                       dAccountId,
                       dChain,
-                      disclose(escrowRef),
-                      disclose(clawbackAuthHash),
+                      dEscrowRef,
+                      dClawbackAuthHash,
                       dCap,
-                      disclose(expiresAt),
+                      dExpiresAt,
                       dPkX,
                       dPkY,
                       dNonce,
@@ -493,7 +745,35 @@ export circuit registerEscrowBinding(
                     );
   verifySchnorr(userSig, userKey, userMsg);
 
+  const nowTs = nowBounded();
+  assert(dExpiresAt > nowTs, "Escrow binding expired");
+
   const bKey = disclose(bindingKey(dAccountId, dChain));
+  if (escrowBindings.member(bKey)) {
+    const existing = escrowBindings.lookup(bKey);
+    assert(existing.expiresAt < nowTs, "Active binding exists");
+  }
+  const lifecycleKey = disclose(escrowLifecycleKey(dChain, dEscrowRef));
+  assert(!escrowStatuses.member(lifecycleKey), "Escrow lifecycle already initialized");
+  assert(!registeredEscrows.member(lifecycleKey), "Escrow already registered");
+
+  const bridgeMsg = degradeToTransient(
+                      hashEscrowBindingAttestation(
+                        dAccountId,
+                        dChain,
+                        dEscrowRef,
+                        dClawbackAuthHash,
+                        dCap,
+                        dExpiresAt,
+                        dBridgeEvidenceHash,
+                        chainDomain,
+                        bridgeDeploymentId,
+                        )
+                      );
+  verifyCommitteeQuorum(bridgeSigs, committee, bridgeMsg);
+  registeredEscrows.insert(lifecycleKey, true);
+  escrowStatuses.insert(lifecycleKey, disclose(statusRegistered()));
+
   escrowBindings.insert(
     bKey,
     disclose(EscrowBinding { chainId: chainId,
@@ -502,6 +782,61 @@ export circuit registerEscrowBinding(
                              cap: cap,
                              expiresAt: expiresAt, })
     );
+}
+
+export circuit activateEscrowBinding(
+                 accountId: Bytes<32>,
+                 chainId: Uint<8>,
+                 escrowRef: Bytes<32>,
+                 terminalEvidenceHash: Bytes<32>,
+                 activationSigs: Vector<3, SchnorrSignature>,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedCerts, "Certs paused");
+
+  const dAccountId = disclose(accountId);
+  const dChain = disclose(chainId);
+  const dEscrow = disclose(escrowRef);
+  assert(dEscrow != pad(32, ""), "escrow ref required");
+  const dTerminalEvidenceHash = disclose(terminalEvidenceHash);
+  assert(dTerminalEvidenceHash != pad(32, ""), "terminal evidence hash required");
+
+  assert(chainConfigs.member(dChain), "Chain not registered");
+  const cfg = chainConfigs.lookup(dChain);
+  assert(cfg.enabled, "Chain disabled");
+  const chainDomain = assertChainDomainCurrent(dChain, cfg);
+  const committee = committees.lookup(dChain);
+
+  const bKey = disclose(bindingKey(dAccountId, dChain));
+  assert(escrowBindings.member(bKey), "No escrow binding for (account, chain)");
+  const b = escrowBindings.lookup(bKey);
+  assert(b.chainId == dChain, "binding chain mismatch");
+  assert(b.escrowRef == dEscrow, "escrowRef mismatch");
+  const nowTs = nowBounded();
+  assert(nowTs < b.expiresAt, "Escrow binding expired");
+
+  const lifecycleKey = disclose(escrowLifecycleKey(dChain, dEscrow));
+  assert(escrowStatuses.member(lifecycleKey), "Escrow lifecycle missing");
+  assert(escrowStatuses.lookup(lifecycleKey) == statusRegistered(), "Escrow not registered");
+
+  const activeKey =
+          disclose(escrowStateKey(pad(32, "settlement:active"), dAccountId, dChain, dEscrow));
+  assert(!activatedEscrows.member(activeKey), "Escrow already activated");
+
+  const msg = degradeToTransient(
+                hashEscrowActivationAttestation(
+                  dAccountId,
+                  dChain,
+                  dEscrow,
+                  dTerminalEvidenceHash,
+                  chainDomain,
+                  bridgeDeploymentId,
+                  )
+                );
+  verifyCommitteeQuorum(activationSigs, committee, msg);
+
+  activatedEscrows.insert(activeKey, true);
+  escrowStatuses.insert(lifecycleKey, disclose(statusActivated()));
 }
 
 export circuit attestBatch(
@@ -545,7 +880,11 @@ export circuit attestBatch(
   attestationCount = disclose((attestationCount + 1) as Uint<64>);
 }
 
-export circuit issueLossCertificate(header: LossCertHeader, sigs: Vector<3, SchnorrSignature>,): [] {
+export circuit issueLossCertificate(
+                 header: LossCertHeader,
+                 positionsRootAtIssue: Bytes<32>,
+                 sigs: Vector<3, SchnorrSignature>,
+                 ): [] {
   requireSequencer();
   assert(!pausedCerts, "Certs paused");
 
@@ -554,31 +893,58 @@ export circuit issueLossCertificate(header: LossCertHeader, sigs: Vector<3, Schn
   const dEscrow = disclose(header.escrowRef);
   const dLoss = disclose(header.lossAmount);
   const dCertNonce = disclose(header.certNonce);
+  const dPositionsRoot = disclose(positionsRootAtIssue);
+  assertSupportedSourceChain(dChain);
+  assert(dEscrow != pad(32, ""), "escrow ref required");
   assert(dLoss >= 1, "loss must be positive");
-
-  assertAndBumpCertHwm(dAccountId, dCertNonce);
+  assert(dPositionsRoot == positionsRoot, "positionsRoot mismatch");
 
   const bKey = disclose(bindingKey(dAccountId, dChain));
   assert(escrowBindings.member(bKey), "No escrow binding for (account, chain)");
   const b = escrowBindings.lookup(bKey);
+  assert(b.chainId == dChain, "binding chain mismatch");
   assert(b.escrowRef == dEscrow, "escrowRef mismatch");
+  assert(dLoss == b.cap, "Loss must consume full escrow");
+
+  const activeKey =
+          disclose(escrowStateKey(pad(32, "settlement:active"), dAccountId, dChain, dEscrow));
+  assert(activatedEscrows.member(activeKey), "Escrow not activated");
+
+  const consumedKey =
+          disclose(escrowStateKey(pad(32, "settlement:consumed"), dAccountId, dChain, dEscrow));
+  assert(!consumedEscrows.member(consumedKey), "Escrow already consumed");
+  const lifecycleKey = disclose(escrowLifecycleKey(dChain, dEscrow));
+  assert(escrowStatuses.member(lifecycleKey), "Escrow lifecycle missing");
+  assert(escrowStatuses.lookup(lifecycleKey) == statusActivated(), "Escrow not activated");
 
   const nowTs = nowBounded();
   assert(nowTs <= b.expiresAt, "Clawback authorization expired");
 
+  const clawbackKey =
+          disclose(escrowStateKey(pad(32, "settlement:clawback"), dAccountId, dChain, dEscrow));
   const prevClawback =
-          issuedClawback.member(dAccountId) ? issuedClawback.lookup(dAccountId) : 0 as Uint<128>;
+          issuedClawback.member(clawbackKey) ? issuedClawback.lookup(clawbackKey) : 0 as Uint<128>;
   assert(prevClawback <= b.cap, "Internal: clawback already exceeds cap");
   assert(dLoss <= (b.cap - prevClawback) as Uint<128>, "Clawback exceeds cap");
 
   assert(chainConfigs.member(dChain), "Chain not registered");
   const cfg = chainConfigs.lookup(dChain);
+  assert(cfg.enabled, "Chain disabled");
+  const chainDomain = assertChainDomainCurrent(dChain, cfg);
+  const certNonceKey = disclose(terminalCertNonceKey(chainDomain, dEscrow));
+  assertAndBumpCertHwm(certNonceKey, dCertNonce);
+  const terminalNullifier = disclose(terminalCertNullifierKey(chainDomain, dEscrow));
+  assert(!terminalCertNullifiers.member(terminalNullifier), "Terminal cert already consumed");
   const committee = committees.lookup(dChain);
-  const certHash = hashLossCert(header, cfg.certDomain);
+  const certHash = hashLossCert(header, chainDomain, dPositionsRoot);
   const msg = degradeToTransient(certHash);
   verifyCommitteeQuorum(sigs, committee, msg);
 
-  issuedClawback.insert(dAccountId, disclose((prevClawback + dLoss) as Uint<128>));
+  consumedEscrows.insert(consumedKey, true);
+  terminalCertNullifiers.insert(terminalNullifier, true);
+  escrowTerminalDomains.insert(lifecycleKey, chainDomain);
+  escrowStatuses.insert(lifecycleKey, disclose(statusConsumed()));
+  issuedClawback.insert(clawbackKey, disclose((prevClawback + dLoss) as Uint<128>));
   issuedLossCertCount = disclose((issuedLossCertCount + 1) as Uint<64>);
 }
 
@@ -596,43 +962,129 @@ export circuit issueSettlementCertificate(
   const dAmount = disclose(header.withdrawAmount);
   const dCertNonce = disclose(header.certNonce);
   const dPositionsRoot = disclose(positionsRootAtIssue);
+  assertSupportedSourceChain(dChain);
+  assert(dEscrow != pad(32, ""), "escrow ref required");
   assert(dAmount >= 1, "amount must be positive");
 
   assert(dPositionsRoot == positionsRoot, "positionsRoot mismatch");
 
-  assertAndBumpCertHwm(dAccountId, dCertNonce);
-
   const bKey = disclose(bindingKey(dAccountId, dChain));
   assert(escrowBindings.member(bKey), "No escrow binding for (account, chain)");
   const b = escrowBindings.lookup(bKey);
+  assert(b.chainId == dChain, "binding chain mismatch");
   assert(b.escrowRef == dEscrow, "escrowRef mismatch");
+  assert(dAmount == b.cap, "Settlement must consume full escrow");
+
+  const activeKey =
+          disclose(escrowStateKey(pad(32, "settlement:active"), dAccountId, dChain, dEscrow));
+  assert(activatedEscrows.member(activeKey), "Escrow not activated");
+
+  const consumedKey =
+          disclose(escrowStateKey(pad(32, "settlement:consumed"), dAccountId, dChain, dEscrow));
+  assert(!consumedEscrows.member(consumedKey), "Escrow already consumed");
+  const lifecycleKey = disclose(escrowLifecycleKey(dChain, dEscrow));
+  assert(escrowStatuses.member(lifecycleKey), "Escrow lifecycle missing");
+  assert(escrowStatuses.lookup(lifecycleKey) == statusActivated(), "Escrow not activated");
 
   const nowTs = nowBounded();
   assert(nowTs <= b.expiresAt, "Settlement authorization expired");
 
+  const settlementKey =
+          disclose(escrowStateKey(pad(32, "settlement:settled"), dAccountId, dChain, dEscrow));
   const prevSettlement =
-          issuedSettlement.member(dAccountId) ? issuedSettlement.lookup(dAccountId) : 0 as Uint<128>;
+          issuedSettlement.member(settlementKey) ? issuedSettlement.lookup(settlementKey) : 0 as Uint<128>;
   assert(prevSettlement <= b.cap, "Internal: settlement already exceeds cap");
   assert(dAmount <= (b.cap - prevSettlement) as Uint<128>, "Settlement exceeds cap");
 
   assert(chainConfigs.member(dChain), "Chain not registered");
   const cfg = chainConfigs.lookup(dChain);
+  assert(cfg.enabled, "Chain disabled");
+  const chainDomain = assertChainDomainCurrent(dChain, cfg);
+  const certNonceKey = disclose(terminalCertNonceKey(chainDomain, dEscrow));
+  assertAndBumpCertHwm(certNonceKey, dCertNonce);
+  const terminalNullifier = disclose(terminalCertNullifierKey(chainDomain, dEscrow));
+  assert(!terminalCertNullifiers.member(terminalNullifier), "Terminal cert already consumed");
   const committee = committees.lookup(dChain);
-  const certHash = hashSettlementCert(header, cfg.certDomain);
+  const certHash = hashSettlementCert(header, chainDomain, dPositionsRoot);
   const msg = degradeToTransient(certHash);
   verifyCommitteeQuorum(sigs, committee, msg);
 
-  issuedSettlement.insert(dAccountId, disclose((prevSettlement + dAmount) as Uint<128>));
+  consumedEscrows.insert(consumedKey, true);
+  terminalCertNullifiers.insert(terminalNullifier, true);
+  escrowTerminalDomains.insert(lifecycleKey, chainDomain);
+  escrowStatuses.insert(lifecycleKey, disclose(statusConsumed()));
+  issuedSettlement.insert(settlementKey, disclose((prevSettlement + dAmount) as Uint<128>));
   issuedSettlementCertCount = disclose((issuedSettlementCertCount + 1) as Uint<64>);
 }
 
 export circuit pruneStaleEscrowBinding(accountId: Bytes<32>, chainId: Uint<8>,): [] {
   requireSequencer();
-  const bKey = disclose(bindingKey(disclose(accountId), disclose(chainId)));
+  const dAccountId = disclose(accountId);
+  const dChain = disclose(chainId);
+  assertSupportedSourceChain(dChain);
+  const bKey = disclose(bindingKey(dAccountId, dChain));
   assert(escrowBindings.member(bKey), "No escrow binding to prune");
   const b = escrowBindings.lookup(bKey);
+  const dEscrow = b.escrowRef;
+  assert(dEscrow != pad(32, ""), "escrow ref required");
   const nowTs = nowBounded();
-  assert(b.expiresAt < nowTs, "Binding not yet expired");
+  assert((b.expiresAt + 604800 as Uint<64>) as Uint<64> < nowTs, "Escrow retention not elapsed");
+
+  const lifecycleKey = disclose(escrowLifecycleKey(dChain, dEscrow));
+  assert(escrowStatuses.member(lifecycleKey), "Escrow lifecycle missing");
+  const status = escrowStatuses.lookup(lifecycleKey);
+  const clawbackKey =
+          disclose(escrowStateKey(pad(32, "settlement:clawback"), dAccountId, dChain, dEscrow));
+  const settlementKey =
+          disclose(escrowStateKey(pad(32, "settlement:settled"), dAccountId, dChain, dEscrow));
+  const oldClawback =
+          issuedClawback.member(clawbackKey) ? issuedClawback.lookup(clawbackKey) : 0 as Uint<128>;
+  const oldSettlement =
+          issuedSettlement.member(settlementKey) ? issuedSettlement.lookup(settlementKey) : 0 as Uint<128>;
+  settlementArchiveRoot =
+    disclose(hashSettlementArchive(
+               settlementArchiveRoot,
+               dAccountId,
+               dChain,
+               dEscrow,
+               status,
+               oldClawback,
+               oldSettlement,
+               ));
+
+  if (escrowTerminalDomains.member(lifecycleKey)) {
+    const chainDomain = escrowTerminalDomains.lookup(lifecycleKey);
+    const certNonceKey = disclose(terminalCertNonceKey(chainDomain, dEscrow));
+    if (certNonceHwm.member(certNonceKey)) {
+      certNonceHwm.remove(certNonceKey);
+    }
+    const terminalNullifier = disclose(terminalCertNullifierKey(chainDomain, dEscrow));
+    if (terminalCertNullifiers.member(terminalNullifier)) {
+      terminalCertNullifiers.remove(terminalNullifier);
+    }
+    escrowTerminalDomains.remove(lifecycleKey);
+  }
+
+  const activeKey =
+          disclose(escrowStateKey(pad(32, "settlement:active"), dAccountId, dChain, dEscrow));
+  const consumedKey =
+          disclose(escrowStateKey(pad(32, "settlement:consumed"), dAccountId, dChain, dEscrow));
+  if (registeredEscrows.member(lifecycleKey)) {
+    registeredEscrows.remove(lifecycleKey);
+  }
+  if (activatedEscrows.member(activeKey)) {
+    activatedEscrows.remove(activeKey);
+  }
+  if (consumedEscrows.member(consumedKey)) {
+    consumedEscrows.remove(consumedKey);
+  }
+  if (issuedClawback.member(clawbackKey)) {
+    issuedClawback.remove(clawbackKey);
+  }
+  if (issuedSettlement.member(settlementKey)) {
+    issuedSettlement.remove(settlementKey);
+  }
+  escrowStatuses.remove(lifecycleKey);
   escrowBindings.remove(bKey);
 }
 
