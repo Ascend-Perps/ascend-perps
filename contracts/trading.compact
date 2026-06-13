@@ -1,4 +1,4 @@
-pragma language_version >= 0.22;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 
@@ -71,17 +71,49 @@ struct Order {
 
 struct EscrowMirror {
   chainId: Uint<8>;
-  escrowBindingHash: Bytes<32>;
+  escrowRef: Bytes<32>;
+  activatedEscrowHash: Bytes<32>;
+  terminalEvidenceHash: Bytes<32>;
+  cap: Uint<128>;
   expiresAt: Uint<64>;
 }
+
+struct AccountCollateral {
+  cap: Uint<128>;
+  expiresAt: Uint<64>;
+}
+
+struct CreditDomainConfig {
+  chainId: Uint<8>;
+  enabled: Boolean;
+  domain: Bytes<32>;
+  sourceContractId: Bytes<32>;
+  targetChainId: Uint<8>;
+  targetContractId: Bytes<32>;
+  committeeEpoch: Uint<64>;
+}
+
+struct CommitteeKeys {
+  slot0: VerifierKey;
+  slot1: VerifierKey;
+  slot2: VerifierKey;
+  slot3: VerifierKey;
+  slot4: VerifierKey;
+  slotCount: Uint<8>;
+}
+
+witness committeeSlotChoice0(): Uint<8>;
+witness committeeSlotChoice1(): Uint<8>;
+witness committeeSlotChoice2(): Uint<8>;
 
 witness sequencerSecret(): Maybe<Bytes<32>>;
 
 witness governorSecret(): Maybe<Bytes<32>>;
 
-witness jubjubFrModulusWitness(): Field;
-
 witness currentTime(): Uint<64>;
+
+struct DivResult { q: Uint<128>, r: Uint<128> }
+witness reduceQuoteDiv(num: Field, den: Field): DivResult;
 
 circuit hashSignerPk(sk: Bytes<32>, domain: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([domain, sk]);
@@ -102,7 +134,7 @@ circuit requireGovernor(): [] {
 }
 
 circuit jubjubFrModulus(): Field {
-  return disclose(jubjubFrModulusWitness());
+  return 6554484396890773809930967563523245729705921265872317281365359162392183254199 as Field;
 }
 
 circuit nowBounded(): Uint<64> {
@@ -130,6 +162,64 @@ circuit verifySchnorr(sig: SchnorrSignature, vk: VerifierKey, messageHash: Field
   assert(reconstructed == hFull, "Schnorr: challenge not bound to message");
 }
 
+circuit pickKey(c: CommitteeKeys, idx: Uint<8>): VerifierKey {
+  if (idx == 0 as Uint<8>) {
+    return c.slot0;
+  } else if (idx == 1 as Uint<8>) {
+    return c.slot1;
+  } else if (idx == 2 as Uint<8>) {
+    return c.slot2;
+  } else if (idx == 3 as Uint<8>) {
+    return c.slot3;
+  } else {
+    return c.slot4;
+  }
+}
+
+circuit verifyCommitteeQuorum(
+          sigs: Vector<3, SchnorrSignature>,
+          committee: CommitteeKeys,
+          messageHash: Field,
+          ): [] {
+  const i0 = disclose(committeeSlotChoice0());
+  const i1 = disclose(committeeSlotChoice1());
+  const i2 = disclose(committeeSlotChoice2());
+  assert(i0 < 5 as Uint<8>, "slot0 out of range");
+  assert(i1 < 5 as Uint<8>, "slot1 out of range");
+  assert(i2 < 5 as Uint<8>, "slot2 out of range");
+  assert(i0 != i1, "slot0 == slot1");
+  assert(i0 != i2, "slot0 == slot2");
+  assert(i1 != i2, "slot1 == slot2");
+  verifySchnorr(sigs[0], pickKey(committee, i0), messageHash);
+  verifySchnorr(sigs[1], pickKey(committee, i1), messageHash);
+  verifySchnorr(sigs[2], pickKey(committee, i2), messageHash);
+}
+
+circuit assertSlotNonZero(k: VerifierKey): [] {
+  assert(k.x != 0 || k.y != 0, "committee slot zero");
+}
+
+circuit assertCommitteeDistinct(c: CommitteeKeys): [] {
+
+  assert(c.slotCount == 5 as Uint<8>, "committee slot count must be 5");
+  assertSlotNonZero(c.slot0);
+  assertSlotNonZero(c.slot1);
+  assertSlotNonZero(c.slot2);
+  assertSlotNonZero(c.slot3);
+  assertSlotNonZero(c.slot4);
+
+  assert(!(c.slot0.x == c.slot1.x && c.slot0.y == c.slot1.y), "slots 0,1 equal");
+  assert(!(c.slot0.x == c.slot2.x && c.slot0.y == c.slot2.y), "slots 0,2 equal");
+  assert(!(c.slot0.x == c.slot3.x && c.slot0.y == c.slot3.y), "slots 0,3 equal");
+  assert(!(c.slot0.x == c.slot4.x && c.slot0.y == c.slot4.y), "slots 0,4 equal");
+  assert(!(c.slot1.x == c.slot2.x && c.slot1.y == c.slot2.y), "slots 1,2 equal");
+  assert(!(c.slot1.x == c.slot3.x && c.slot1.y == c.slot3.y), "slots 1,3 equal");
+  assert(!(c.slot1.x == c.slot4.x && c.slot1.y == c.slot4.y), "slots 1,4 equal");
+  assert(!(c.slot2.x == c.slot3.x && c.slot2.y == c.slot3.y), "slots 2,3 equal");
+  assert(!(c.slot2.x == c.slot4.x && c.slot2.y == c.slot4.y), "slots 2,4 equal");
+  assert(!(c.slot3.x == c.slot4.x && c.slot3.y == c.slot4.y), "slots 3,4 equal");
+}
+
 circuit assertAndBumpHwm(scopeTag: Bytes<32>, accountId: Bytes<32>, nonce: Uint<64>): [] {
   const key = disclose(persistentHash<Vector<2, Bytes<32>>>([scopeTag, accountId]));
   const current = userNonceHwm.member(key) ? userNonceHwm.lookup(key) : 0 as Uint<64>;
@@ -145,6 +235,12 @@ circuit assertAndBumpReceiptHwm(accountId: Bytes<32>, receiptNonce: Uint<64>): [
   attestorReceiptHwm.insert(accountId, receiptNonce);
 }
 
+circuit accountIdForUserKey(userPkX: Field, userPkY: Field): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:account:v1"), userPkX as Bytes<32>, userPkY as Bytes<32>,]
+           );
+}
+
 circuit positionKey(accountId: Bytes<32>, marketIndex: Uint<16>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>(
            [pad(32, "ascend:position"), accountId, marketIndex as Bytes<32>,]
@@ -157,10 +253,173 @@ circuit orderKey(accountId: Bytes<32>, nonce: Uint<64>): Bytes<32> {
            );
 }
 
+circuit escrowMirrorStateKey(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          terminalEvidenceHash: Bytes<32>,
+          ): Bytes<32> {
+  return persistentHash<Vector<5, Bytes<32>>>(
+           [pad(32, "ascend:mirror"), accountId, chainId as Bytes<32>, escrowRef, terminalEvidenceHash,]
+           );
+}
+
+circuit sourceEscrowCreditKey(chainId: Uint<8>, escrowRef: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>(
+           [pad(32, "ascend:source-escrow"), chainId as Bytes<32>, escrowRef,]
+           );
+}
+
+circuit assertSupportedSourceChain(chainId: Uint<8>): [] {
+  assert(chainId == 1 as Uint<8> || chainId == 2 as Uint<8> || chainId == 3 as Uint<8>, "Unsupported source chain");
+}
+
+circuit protocolId(): Bytes<32> {
+  return pad(32, "ascend:perps:v2");
+}
+
+circuit hashDomainTupleV2(
+          domainBridgeDeploymentId: Bytes<32>,
+          sourceChainId: Uint<8>,
+          sourceContractId: Bytes<32>,
+          targetChainId: Uint<8>,
+          targetContractId: Bytes<32>,
+          committeeEpoch: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(
+           [pad(32, "ascend:domain-tuple:v2"),
+            protocolId(),
+            domainBridgeDeploymentId,
+            sourceChainId as Bytes<32>,
+            sourceContractId,
+            targetChainId as Bytes<32>,
+            targetContractId,
+            committeeEpoch as Bytes<32>,]
+           );
+}
+
+circuit assertCreditDomainCurrent(chainId: Uint<8>): Bytes<32> {
+  assertSupportedSourceChain(chainId);
+  assert(creditDomainConfigs.member(chainId), "Credit domain not set for chain");
+  const cfg = creditDomainConfigs.lookup(chainId);
+  assert(cfg.enabled, "Credit domain disabled");
+  assert(cfg.chainId == chainId, "Credit domain chain mismatch");
+  assert(cfg.sourceContractId != pad(32, ""), "source contract id missing");
+  assert(cfg.targetContractId != pad(32, ""), "target contract id missing");
+  assert(cfg.committeeEpoch > 0 as Uint<64>, "Committee epoch must be positive");
+  const expectedDomain =
+          disclose(hashDomainTupleV2(
+                     bridgeDeploymentId,
+                     chainId,
+                     cfg.sourceContractId,
+                     cfg.targetChainId,
+                     cfg.targetContractId,
+                     cfg.committeeEpoch,
+                     ));
+  assert(cfg.domain == expectedDomain, "Credit domain mismatch");
+  return expectedDomain;
+}
+
 circuit notionalQuote(size: Uint<64>, price: Uint<32>): Uint<128> {
   const sizeF = size as Field;
   const priceF = price as Field;
   return (sizeF * priceF) as Uint<128>;
+}
+
+circuit assertActiveAccountCollateral(accountId: Bytes<32>, nowTs: Uint<64>): AccountCollateral {
+  assert(accountCollateralCap.member(accountId), "No activated escrow collateral");
+  assert(accountCollateralExpiresAt.member(accountId), "No collateral expiry");
+  const cap = accountCollateralCap.lookup(accountId);
+  const expiresAt = accountCollateralExpiresAt.lookup(accountId);
+  assert(cap > 0 as Uint<128>, "No active collateral cap");
+  assert(nowTs < expiresAt, "Escrow collateral expired");
+  return AccountCollateral { cap: cap, expiresAt: expiresAt };
+}
+
+circuit addMirroredCollateral(
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          activatedEscrowHash: Bytes<32>,
+          terminalEvidenceHash: Bytes<32>,
+          cap: Uint<128>,
+          expiresAt: Uint<64>,
+          ): [] {
+  const dChain = disclose(chainId);
+  assertSupportedSourceChain(dChain);
+  const dEscrowRef = disclose(escrowRef);
+  assert(dEscrowRef != pad(32, ""), "Escrow ref required");
+  const dActivatedEscrowHash = disclose(activatedEscrowHash);
+  assert(dActivatedEscrowHash != pad(32, ""), "Activated escrow hash required");
+  const dTerminalEvidenceHash = disclose(terminalEvidenceHash);
+  assert(dTerminalEvidenceHash != pad(32, ""), "Terminal evidence hash required");
+  const dCap = disclose(cap);
+  assert(dCap > 0 as Uint<128>, "Collateral cap must be positive");
+  const dExpiresAt = disclose(expiresAt);
+  const nowTs = nowBounded();
+  assert(nowTs < dExpiresAt, "Escrow mirror expired");
+  const sourceKey = disclose(sourceEscrowCreditKey(dChain, dEscrowRef));
+  assert(!creditedSourceEscrows.member(sourceKey), "Source escrow already credited");
+  const mirrorKey = disclose(escrowMirrorStateKey(accountId, dChain, dEscrowRef, dTerminalEvidenceHash));
+  assert(!escrowMirrors.member(mirrorKey), "Escrow mirror already active");
+
+  const currentCap =
+          accountCollateralCap.member(accountId)
+            ? accountCollateralCap.lookup(accountId)
+            : 0 as Uint<128>;
+  const nextCap = (currentCap + dCap) as Uint<128>;
+  assert(nextCap >= currentCap, "Account collateral cap overflow");
+  if (accountCollateralExpiresAt.member(accountId)) {
+    const currentExpiresAt = accountCollateralExpiresAt.lookup(accountId);
+    assert(dExpiresAt >= currentExpiresAt, "Collateral expiry cannot move earlier");
+  } else {
+    accountCollateralExpiresAt.insert(accountId, dExpiresAt);
+  }
+  accountCollateralCap.insert(accountId, nextCap);
+  creditedSourceEscrows.insert(sourceKey, true);
+  escrowMirrors.insert(
+    mirrorKey,
+    disclose(EscrowMirror { chainId: dChain,
+                            escrowRef: dEscrowRef,
+                            activatedEscrowHash: dActivatedEscrowHash,
+                            terminalEvidenceHash: dTerminalEvidenceHash,
+                            cap: dCap,
+                            expiresAt: dExpiresAt, })
+    );
+}
+
+circuit addAccountUsage(accountId: Bytes<32>, amount: Uint<128>, cap: Uint<128>): [] {
+  const used = accountUsedQuote.member(accountId) ? accountUsedQuote.lookup(accountId) : 0 as Uint<128>;
+  const next = (used + amount) as Uint<128>;
+  assert(next <= cap, "Account collateral cap exceeded");
+  accountUsedQuote.insert(accountId, next);
+}
+
+circuit assertAccountUsageWithinCap(accountId: Bytes<32>, cap: Uint<128>): [] {
+  const used = accountUsedQuote.member(accountId) ? accountUsedQuote.lookup(accountId) : 0 as Uint<128>;
+  assert(used <= cap, "Account collateral cap below usage");
+}
+
+circuit replaceAccountPositionUsage(
+          accountId: Bytes<32>,
+          releaseReserved: Uint<128>,
+          oldPositionQuote: Uint<128>,
+          newPositionQuote: Uint<128>,
+          cap: Uint<128>,
+          ): [] {
+  const used = accountUsedQuote.member(accountId) ? accountUsedQuote.lookup(accountId) : 0 as Uint<128>;
+  const releaseTotal = (releaseReserved + oldPositionQuote) as Uint<128>;
+  assert(used >= releaseTotal, "Account usage underflow");
+  const remaining = (used - releaseTotal) as Uint<128>;
+  const next = (remaining + newPositionQuote) as Uint<128>;
+  assert(next <= cap, "Account collateral cap exceeded");
+  accountUsedQuote.insert(accountId, next);
+}
+
+circuit releaseOrderUsage(accountId: Bytes<32>, orderReserved: Uint<128>): [] {
+  const used = accountUsedQuote.member(accountId) ? accountUsedQuote.lookup(accountId) : 0 as Uint<128>;
+  assert(used >= orderReserved, "Account usage underflow");
+  accountUsedQuote.insert(accountId, disclose((used - orderReserved) as Uint<128>));
 }
 
 circuit applyFillToPosition(
@@ -189,9 +448,12 @@ circuit applyFillToPosition(
                       lastFundingIsNeg: st.fundingIsNeg, };
   } else if (fillSize <= old.size) {
     const newSize = (old.size - fillSize) as Uint<64>;
-    const oldEntryF = old.entryPrice as Field;
-    const newSizeF = newSize as Field;
-    const newQuote = newSize == 0 as Uint<64> ? 0 as Uint<128> : (oldEntryF * newSizeF) as Uint<128>;
+    const numF = (old.entryQuote as Field) * (newSize as Field);
+    const dvRaw = reduceQuoteDiv(numF, old.size as Field);
+    const dv = DivResult { q: disclose(dvRaw.q), r: disclose(dvRaw.r) };
+    assert((dv.q as Field) * (old.size as Field) + (dv.r as Field) == numF, "MT-1: quotient witness mismatch");
+    assert(dv.r < (old.size as Uint<128>), "MT-1: remainder out of range");
+    const newQuote = newSize == 0 as Uint<64> ? 0 as Uint<128> : dv.q;
     const newEntry = newSize == 0 as Uint<64> ? 0 as Uint<64> : old.entryPrice;
     return Position { size: newSize,
                       isLong: old.isLong,
@@ -212,61 +474,98 @@ circuit applyFillToPosition(
 }
 
 circuit hashRegisterIntent(
+          bridgeDeploymentId: Bytes<32>,
+          domain: Bytes<32>,
           accountId: Bytes<32>,
           chainId: Uint<8>,
           escrowRef: Bytes<32>,
           clawbackAuthHash: Bytes<32>,
           cap: Uint<128>,
           expiresAt: Uint<64>,
+          terminalEvidenceHash: Bytes<32>,
           userPkX: Field,
           userPkY: Field,
           nonce: Uint<64>,
           ): Bytes<32> {
-  return persistentHash<Vector<10, Bytes<32>>>(
+  return persistentHash<Vector<13, Bytes<32>>>(
            [pad(32, "ascend:perps:register"),
+            bridgeDeploymentId,
+            domain,
             accountId,
             chainId as Bytes<32>,
             escrowRef,
             clawbackAuthHash,
             cap as Bytes<32>,
             expiresAt as Bytes<32>,
+            terminalEvidenceHash,
             userPkX as Bytes<32>,
             userPkY as Bytes<32>,
             nonce as Bytes<32>,]
            );
 }
 
-circuit hashEscrowBindingForReceipt(
+circuit hashActivatedEscrowForReceipt(
+          bridgeDeploymentId: Bytes<32>,
+          domain: Bytes<32>,
           chainId: Uint<8>,
           escrowRef: Bytes<32>,
           clawbackAuthHash: Bytes<32>,
           cap: Uint<128>,
           expiresAt: Uint<64>,
+          terminalEvidenceHash: Bytes<32>,
           ): Bytes<32> {
-  return persistentHash<Vector<6, Bytes<32>>>(
-           [pad(32, "ascend:bridge:escrowbinding"),
+  return persistentHash<Vector<9, Bytes<32>>>(
+           [pad(32, "ascend:bridge:activated-escrow"),
+            bridgeDeploymentId,
+            domain,
             chainId as Bytes<32>,
             escrowRef,
             clawbackAuthHash,
             cap as Bytes<32>,
-            expiresAt as Bytes<32>,]
+            expiresAt as Bytes<32>,
+            terminalEvidenceHash,]
            );
 }
 
-circuit hashBindReceipt(
+circuit hashActivatedBindReceipt(
+          bridgeDeploymentId: Bytes<32>,
+          domain: Bytes<32>,
           accountId: Bytes<32>,
           chainId: Uint<8>,
-          escrowBindingHash: Bytes<32>,
+          activatedEscrowHash: Bytes<32>,
           expiresAt: Uint<64>,
           receiptNonce: Uint<64>,
           ): Bytes<32> {
-  return persistentHash<Vector<6, Bytes<32>>>(
-           [pad(32, "ascend:bridge:bind"),
+  return persistentHash<Vector<8, Bytes<32>>>(
+           [pad(32, "ascend:bridge:bind:activated"),
+            bridgeDeploymentId,
+            domain,
             accountId,
             chainId as Bytes<32>,
-            escrowBindingHash,
+            activatedEscrowHash,
             expiresAt as Bytes<32>,
             receiptNonce as Bytes<32>,]
+           );
+}
+
+circuit hashRevokeEscrowMirror(
+          bridgeDeploymentId: Bytes<32>,
+          domain: Bytes<32>,
+          accountId: Bytes<32>,
+          chainId: Uint<8>,
+          escrowRef: Bytes<32>,
+          terminalEvidenceHash: Bytes<32>,
+          revokeNonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(
+           [pad(32, "ascend:bridge:revoke"),
+            bridgeDeploymentId,
+            domain,
+            accountId,
+            chainId as Bytes<32>,
+            escrowRef,
+            terminalEvidenceHash,
+            revokeNonce as Bytes<32>,]
            );
 }
 
@@ -300,11 +599,65 @@ circuit hashCancelOrderOp(accountId: Bytes<32>, nonce: Uint<64>): Bytes<32> {
            );
 }
 
-export ledger governorPk: Bytes<32>;
+circuit hashExecuteTradeAuthorization(
+          takerAccountId: Bytes<32>,
+          takerOrderNonce: Uint<64>,
+          makerAccountId: Bytes<32>,
+          makerOrderNonce: Uint<64>,
+          marketIndex: Uint<16>,
+          fillSize: Uint<64>,
+          fillPrice: Uint<32>,
+          executionNonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<9, Bytes<32>>>(
+           [pad(32, "ascend:perps:executeTrade"),
+            takerAccountId,
+            takerOrderNonce as Bytes<32>,
+            makerAccountId,
+            makerOrderNonce as Bytes<32>,
+            marketIndex as Bytes<32>,
+            fillSize as Bytes<32>,
+            fillPrice as Bytes<32>,
+            executionNonce as Bytes<32>,]
+           );
+}
 
-export ledger sequencerPk: Bytes<32>;
+circuit hashPrivateBatchTransition(
+          previousAccountRoot: Bytes<32>,
+          nextAccountRoot: Bytes<32>,
+          previousPositionRoot: Bytes<32>,
+          nextPositionRoot: Bytes<32>,
+          nextOrderCommitmentRoot: Bytes<32>,
+          nextIntentNullifierRoot: Bytes<32>,
+          nextBatchExecutionRoot: Bytes<32>,
+          publicMarketDeltasRoot: Bytes<32>,
+          proofCommitment: Bytes<32>,
+          batchNonce: Uint<64>,
+          ): Bytes<32> {
+  return persistentHash<Vector<11, Bytes<32>>>(
+           [pad(32, "ascend:private-batch:v2"),
+            previousAccountRoot,
+            nextAccountRoot,
+            previousPositionRoot,
+            nextPositionRoot,
+            nextOrderCommitmentRoot,
+            nextIntentNullifierRoot,
+            nextBatchExecutionRoot,
+            publicMarketDeltasRoot,
+            proofCommitment,
+            batchNonce as Bytes<32>,]
+           );
+}
+
+export sealed ledger governorPk: Bytes<32>;
+
+export sealed ledger sequencerPk: Bytes<32>;
 
 export ledger attestorPk: VerifierKey;
+
+export ledger creditCommittee: Map<Uint<8>, CommitteeKeys>;
+
+export ledger creditDomainConfigs: Map<Uint<8>, CreditDomainConfig>;
 
 export ledger pendingAttestorPk: PendingKey;
 
@@ -312,7 +665,13 @@ export ledger pendingAttestorActive: Boolean;
 
 export ledger accountKeys: Map<Bytes<32>, VerifierKey>;
 
-export ledger escrowMirror: Map<Bytes<32>, EscrowMirror>;
+export ledger escrowMirrors: Map<Bytes<32>, EscrowMirror>;
+
+export ledger creditedSourceEscrows: Map<Bytes<32>, Boolean>;
+
+export ledger accountCollateralCap: Map<Bytes<32>, Uint<128>>;
+
+export ledger accountCollateralExpiresAt: Map<Bytes<32>, Uint<64>>;
 
 export ledger markets: Map<Uint<16>, MarketConfig>;
 
@@ -326,19 +685,165 @@ export ledger userNonceHwm: Map<Bytes<32>, Uint<64>>;
 
 export ledger attestorReceiptHwm: Map<Bytes<32>, Uint<64>>;
 
+export ledger executionNonceHwmByMarket: Map<Uint<16>, Uint<64>>;
+
+export ledger revokeNonceHwm: Map<Bytes<32>, Uint<64>>;
+
 export ledger openOrders: Map<Bytes<32>, Uint<32>>;
+
+export ledger orderReservedQuote: Map<Bytes<32>, Uint<128>>;
+
+export ledger accountUsedQuote: Map<Bytes<32>, Uint<128>>;
+
+export ledger accountStateRoot: Bytes<32>;
+
+export ledger positionStateRoot: Bytes<32>;
+
+export ledger orderCommitmentRoot: Bytes<32>;
+
+export ledger intentNullifierRoot: Bytes<32>;
+
+export ledger batchExecutionRoot: Bytes<32>;
+
+export ledger publicMarketDeltasRoot: Bytes<32>;
+
+export ledger privateBatchProofCommitment: Bytes<32>;
+
+export ledger privateBatchNonceHwm: Uint<64>;
 
 export ledger pausedTrading: Boolean;
 
-constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field,) {
+export sealed ledger bridgeDeploymentId: Bytes<32>;
+
+constructor(initGovPk: Bytes<32>, initSeqPk: Bytes<32>, initAttestorX: Field, initAttestorY: Field, initBridgeDeploymentId: Bytes<32>,) {
   assert(initGovPk != pad(32, ""), "governor pk zero");
   assert(initSeqPk != pad(32, ""), "sequencer pk zero");
   assert(initAttestorX != 0 || initAttestorY != 0, "attestor pk zero");
+  assert(initBridgeDeploymentId != pad(32, ""), "bridge deployment id zero");
   governorPk = disclose(initGovPk);
   sequencerPk = disclose(initSeqPk);
   attestorPk = disclose(VerifierKey { x: initAttestorX, y: initAttestorY });
+  bridgeDeploymentId = disclose(initBridgeDeploymentId);
+  accountStateRoot = disclose(pad(32, ""));
+  positionStateRoot = disclose(pad(32, ""));
+  orderCommitmentRoot = disclose(pad(32, ""));
+  intentNullifierRoot = disclose(pad(32, ""));
+  batchExecutionRoot = disclose(pad(32, ""));
+  publicMarketDeltasRoot = disclose(pad(32, ""));
+  privateBatchProofCommitment = disclose(pad(32, ""));
+  privateBatchNonceHwm = disclose(0 as Uint<64>);
   pendingAttestorActive = disclose(false);
   pausedTrading = disclose(false);
+}
+
+export circuit submitBatch(
+                 previousAccountRoot: Bytes<32>,
+                 nextAccountRoot: Bytes<32>,
+                 previousPositionRoot: Bytes<32>,
+                 nextPositionRoot: Bytes<32>,
+                 nextOrderCommitmentRoot: Bytes<32>,
+                 nextIntentNullifierRoot: Bytes<32>,
+                 nextBatchExecutionRoot: Bytes<32>,
+                 nextPublicMarketDeltasRoot: Bytes<32>,
+                 proofCommitment: Bytes<32>,
+                 batchNonce: Uint<64>,
+                 ): [] {
+  requireSequencer();
+  assert(!pausedTrading, "Trading paused");
+
+  const dPreviousAccountRoot = disclose(previousAccountRoot);
+  const dNextAccountRoot = disclose(nextAccountRoot);
+  const dPreviousPositionRoot = disclose(previousPositionRoot);
+  const dNextPositionRoot = disclose(nextPositionRoot);
+  const dNextOrderCommitmentRoot = disclose(nextOrderCommitmentRoot);
+  const dNextIntentNullifierRoot = disclose(nextIntentNullifierRoot);
+  const dNextBatchExecutionRoot = disclose(nextBatchExecutionRoot);
+  const dNextPublicMarketDeltasRoot = disclose(nextPublicMarketDeltasRoot);
+  const dProofCommitment = disclose(proofCommitment);
+  const dBatchNonce = disclose(batchNonce);
+
+  assert(dPreviousAccountRoot == accountStateRoot, "account root mismatch");
+  assert(dPreviousPositionRoot == positionStateRoot, "position root mismatch");
+  assert(dNextAccountRoot != pad(32, ""), "next account root required");
+  assert(dNextPositionRoot != pad(32, ""), "next position root required");
+  assert(dNextOrderCommitmentRoot != pad(32, ""), "next order root required");
+  assert(dNextIntentNullifierRoot != pad(32, ""), "next nullifier root required");
+  assert(dNextBatchExecutionRoot != pad(32, ""), "next batch root required");
+  assert(dProofCommitment != pad(32, ""), "proof commitment required");
+  assert(dBatchNonce > privateBatchNonceHwm, "batch nonce not increasing");
+
+  const transition = disclose(
+                       hashPrivateBatchTransition(
+                         dPreviousAccountRoot,
+                         dNextAccountRoot,
+                         dPreviousPositionRoot,
+                         dNextPositionRoot,
+                         dNextOrderCommitmentRoot,
+                         dNextIntentNullifierRoot,
+                         dNextBatchExecutionRoot,
+                         dNextPublicMarketDeltasRoot,
+                         dProofCommitment,
+                         dBatchNonce,
+                         )
+                       );
+  assert(transition != pad(32, ""), "private batch transition invalid");
+
+  accountStateRoot = dNextAccountRoot;
+  positionStateRoot = dNextPositionRoot;
+  orderCommitmentRoot = dNextOrderCommitmentRoot;
+  intentNullifierRoot = dNextIntentNullifierRoot;
+  batchExecutionRoot = dNextBatchExecutionRoot;
+  publicMarketDeltasRoot = dNextPublicMarketDeltasRoot;
+  privateBatchProofCommitment = dProofCommitment;
+  privateBatchNonceHwm = dBatchNonce;
+}
+
+export circuit setCreditCommittee(chainId: Uint<8>, keys: CommitteeKeys): [] {
+  requireGovernor();
+  const dChain = disclose(chainId);
+  assertSupportedSourceChain(dChain);
+  const dKeys = disclose(keys);
+  assertCommitteeDistinct(dKeys);
+  creditCommittee.insert(dChain, dKeys);
+}
+
+export circuit setCreditDomain(
+                 chainId: Uint<8>,
+                 domain: Bytes<32>,
+                 sourceContractId: Bytes<32>,
+                 targetChainId: Uint<8>,
+                 targetContractId: Bytes<32>,
+                 committeeEpoch: Uint<64>,
+                 ): [] {
+  requireGovernor();
+  const dChain = disclose(chainId);
+  assertSupportedSourceChain(dChain);
+  const dSourceContractId = disclose(sourceContractId);
+  const dTargetContractId = disclose(targetContractId);
+  const dCommitteeEpoch = disclose(committeeEpoch);
+  assert(dSourceContractId != pad(32, ""), "source contract id required");
+  assert(dTargetContractId != pad(32, ""), "target contract id required");
+  assert(dCommitteeEpoch > 0 as Uint<64>, "Committee epoch must be positive");
+  const expectedDomain =
+          disclose(hashDomainTupleV2(
+                     bridgeDeploymentId,
+                     dChain,
+                     dSourceContractId,
+                     disclose(targetChainId),
+                     dTargetContractId,
+                     dCommitteeEpoch,
+                     ));
+  assert(disclose(domain) == expectedDomain, "domain does not match DomainTuple");
+  creditDomainConfigs.insert(
+    dChain,
+    disclose(CreditDomainConfig { chainId: chainId,
+                                  enabled: true,
+                                  domain: expectedDomain,
+                                  sourceContractId: dSourceContractId,
+                                  targetChainId: targetChainId,
+                                  targetContractId: dTargetContractId,
+                                  committeeEpoch: dCommitteeEpoch, })
+    );
 }
 
 export circuit registerAccount(
@@ -348,21 +853,26 @@ export circuit registerAccount(
                  clawbackAuthHash: Bytes<32>,
                  cap: Uint<128>,
                  expiresAt: Uint<64>,
+                 terminalEvidenceHash: Bytes<32>,
                  nonce: Uint<64>,
                  userPkX: Field,
                  userPkY: Field,
                  userSig: SchnorrSignature,
                  receiptNonce: Uint<64>,
-                 attestorSig: SchnorrSignature,
+                 attestorSigs: Vector<3, SchnorrSignature>,
                  ): [] {
   requireSequencer();
   assert(!pausedTrading, "Trading paused");
 
   const dAccountId = disclose(accountId);
   const dChain = disclose(chainId);
+  const creditDomain = assertCreditDomainCurrent(dChain);
   const dPkX = disclose(userPkX);
   const dPkY = disclose(userPkY);
   assert(dPkX != 0 || dPkY != 0, "user pk zero");
+  assert(dAccountId == accountIdForUserKey(dPkX, dPkY), "accountId/user key mismatch");
+  const dTerminalEvidenceHash = disclose(terminalEvidenceHash);
+  assert(dTerminalEvidenceHash != pad(32, ""), "terminal evidence hash required");
 
   const dNonce = disclose(nonce);
   assertAndBumpHwm(pad(32, "trading:user-reg"), dAccountId, dNonce);
@@ -378,12 +888,15 @@ export circuit registerAccount(
   const userKey = VerifierKey { x: dPkX, y: dPkY };
   const userMsg = degradeToTransient(
                     hashRegisterIntent(
+                      bridgeDeploymentId,
+                      creditDomain,
                       dAccountId,
                       dChain,
                       disclose(escrowRef),
                       disclose(clawbackAuthHash),
                       disclose(cap),
                       disclose(expiresAt),
+                      dTerminalEvidenceHash,
                       dPkX,
                       dPkY,
                       dNonce,
@@ -391,67 +904,161 @@ export circuit registerAccount(
                     );
   verifySchnorr(userSig, userKey, userMsg);
 
-  const escrowBindingHash =
-          disclose(hashEscrowBindingForReceipt(
+  const activatedEscrowHash =
+          disclose(hashActivatedEscrowForReceipt(
+                     bridgeDeploymentId,
+                     creditDomain,
                      dChain,
                      disclose(escrowRef),
                      disclose(clawbackAuthHash),
                      disclose(cap),
                      disclose(expiresAt),
+                     dTerminalEvidenceHash,
                      ));
 
   const dReceiptNonce = disclose(receiptNonce);
   assertAndBumpReceiptHwm(dAccountId, dReceiptNonce);
 
   const receiptHash =
-          hashBindReceipt(
+          hashActivatedBindReceipt(
+            bridgeDeploymentId,
+            creditDomain,
             dAccountId,
             dChain,
-            escrowBindingHash,
+            activatedEscrowHash,
             disclose(expiresAt),
             dReceiptNonce,
             );
-  verifySchnorr(attestorSig, attestorPk, degradeToTransient(receiptHash));
-
-  escrowMirror.insert(
+  assert(creditCommittee.member(dChain), "Credit committee not set for chain");
+  verifyCommitteeQuorum(attestorSigs, creditCommittee.lookup(dChain), degradeToTransient(receiptHash));
+  addMirroredCollateral(
     dAccountId,
-    disclose(EscrowMirror { chainId: chainId,
-                            escrowBindingHash: escrowBindingHash,
-                            expiresAt: expiresAt, })
-    );
+    dChain,
+    disclose(escrowRef),
+    activatedEscrowHash,
+    dTerminalEvidenceHash,
+    disclose(cap),
+    disclose(expiresAt),
+  );
+  assertAccountUsageWithinCap(dAccountId, accountCollateralCap.lookup(dAccountId));
 }
 
 export circuit refreshEscrowMirror(
                  accountId: Bytes<32>,
                  chainId: Uint<8>,
-                 escrowBindingHash: Bytes<32>,
+                 escrowRef: Bytes<32>,
+                 clawbackAuthHash: Bytes<32>,
+                 cap: Uint<128>,
                  expiresAt: Uint<64>,
+                 terminalEvidenceHash: Bytes<32>,
                  receiptNonce: Uint<64>,
-                 attestorSig: SchnorrSignature,
+                 attestorSigs: Vector<3, SchnorrSignature>,
                  ): [] {
   requireSequencer();
   const dAccountId = disclose(accountId);
+  const dChainR = disclose(chainId);
+  const creditDomain = assertCreditDomainCurrent(dChainR);
   assert(accountKeys.member(dAccountId), "Account not registered");
+  const dTerminalEvidenceHash = disclose(terminalEvidenceHash);
+  assert(dTerminalEvidenceHash != pad(32, ""), "terminal evidence hash required");
+
+  const activatedEscrowHash =
+          disclose(hashActivatedEscrowForReceipt(
+                     bridgeDeploymentId,
+                     creditDomain,
+                     dChainR,
+                     disclose(escrowRef),
+                     disclose(clawbackAuthHash),
+                     disclose(cap),
+                     disclose(expiresAt),
+                     dTerminalEvidenceHash,
+                     ));
 
   const dReceiptNonce = disclose(receiptNonce);
   assertAndBumpReceiptHwm(dAccountId, dReceiptNonce);
 
   const receiptHash =
-          hashBindReceipt(
+          hashActivatedBindReceipt(
+            bridgeDeploymentId,
+            creditDomain,
             dAccountId,
-            disclose(chainId),
-            disclose(escrowBindingHash),
+            dChainR,
+            activatedEscrowHash,
             disclose(expiresAt),
             dReceiptNonce,
             );
-  verifySchnorr(attestorSig, attestorPk, degradeToTransient(receiptHash));
-
-  escrowMirror.insert(
+  assert(creditCommittee.member(dChainR), "Credit committee not set for chain");
+  verifyCommitteeQuorum(attestorSigs, creditCommittee.lookup(dChainR), degradeToTransient(receiptHash));
+  addMirroredCollateral(
     dAccountId,
-    disclose(EscrowMirror { chainId: chainId,
-                            escrowBindingHash: escrowBindingHash,
-                            expiresAt: expiresAt, })
-    );
+    dChainR,
+    disclose(escrowRef),
+    activatedEscrowHash,
+    dTerminalEvidenceHash,
+    disclose(cap),
+    disclose(expiresAt),
+  );
+  assertAccountUsageWithinCap(dAccountId, accountCollateralCap.lookup(dAccountId));
+}
+
+export circuit revokeEscrowMirror(
+                 accountId: Bytes<32>,
+                 chainId: Uint<8>,
+                 escrowRef: Bytes<32>,
+                 terminalEvidenceHash: Bytes<32>,
+                 revokeNonce: Uint<64>,
+                 attestorSig: SchnorrSignature,
+): [] {
+  requireSequencer();
+  const dAccountId = disclose(accountId);
+  const dChain = disclose(chainId);
+  const creditDomain = assertCreditDomainCurrent(dChain);
+  const dEscrowRef = disclose(escrowRef);
+  const dTerminalEvidenceHash = disclose(terminalEvidenceHash);
+  assert(dTerminalEvidenceHash != pad(32, ""), "terminal evidence hash required");
+  const mirrorKey = disclose(escrowMirrorStateKey(dAccountId, dChain, dEscrowRef, dTerminalEvidenceHash));
+  assert(escrowMirrors.member(mirrorKey), "Escrow mirror not active");
+  const mirror = escrowMirrors.lookup(mirrorKey);
+  const nowTs = nowBounded();
+  const expired = (mirror.expiresAt + 604800 as Uint<64>) as Uint<64> < nowTs;
+  if (!expired) {
+    const dRevokeNonce = disclose(revokeNonce);
+    const currentRevokeNonce =
+            revokeNonceHwm.member(dAccountId) ? revokeNonceHwm.lookup(dAccountId) : 0 as Uint<64>;
+    assert(dRevokeNonce > currentRevokeNonce, "Revoke nonce must be strictly increasing");
+
+    const revokeHash =
+            hashRevokeEscrowMirror(
+              bridgeDeploymentId,
+              creditDomain,
+              dAccountId,
+              dChain,
+              dEscrowRef,
+              dTerminalEvidenceHash,
+              dRevokeNonce,
+              );
+    verifySchnorr(attestorSig, attestorPk, degradeToTransient(revokeHash));
+    revokeNonceHwm.insert(dAccountId, dRevokeNonce);
+  }
+
+  const currentCap =
+          accountCollateralCap.member(dAccountId)
+            ? accountCollateralCap.lookup(dAccountId)
+            : 0 as Uint<128>;
+  assert(currentCap >= mirror.cap, "Account collateral cap underflow");
+  const nextCap = (currentCap - mirror.cap) as Uint<128>;
+  assertAccountUsageWithinCap(dAccountId, nextCap);
+  if (nextCap == 0 as Uint<128>) {
+    accountCollateralCap.remove(dAccountId);
+    accountCollateralExpiresAt.remove(dAccountId);
+  } else {
+    accountCollateralCap.insert(dAccountId, nextCap);
+  }
+  escrowMirrors.remove(mirrorKey);
+  const sourceKey = disclose(sourceEscrowCreditKey(dChain, dEscrowRef));
+  if (creditedSourceEscrows.member(sourceKey)) {
+    creditedSourceEscrows.remove(sourceKey);
+  }
 }
 
 export circuit syncMarket(
@@ -475,6 +1082,7 @@ export circuit syncMarket(
                  ): [] {
   requireGovernor();
   const dIdx = disclose(marketIndex);
+  assert(dIdx < 128 as Uint<16>, "market index out of range");
   markets.insert(
     dIdx,
     disclose(MarketConfig { marketIndex: marketIndex,
@@ -544,14 +1152,14 @@ export circuit createOrder(
   assert(cfg.status == 1, "Market not active");
 
   assert(accountKeys.member(dAccountId), "Account has no registered key");
-  assert(escrowMirror.member(dAccountId), "No escrow binding mirrored");
-  const mirror = escrowMirror.lookup(dAccountId);
   const nowTs = nowBounded();
-  assert(nowTs < mirror.expiresAt, "Escrow binding expired");
+  const collateral = assertActiveAccountCollateral(dAccountId, nowTs);
 
   const dExp = disclose(orderExpiresAt);
   assert(dExp > nowTs, "orderExpiresAt must be in the future");
-  assert(dExp <= mirror.expiresAt, "orderExpiresAt exceeds escrow window");
+  assert(dExp <= collateral.expiresAt, "orderExpiresAt exceeds escrow window");
+  const dOrderType = disclose(orderType);
+  assert(dOrderType == 0 as Uint<8>, "Unsupported order type");
 
   const userKey = accountKeys.lookup(dAccountId);
   const msgHash = degradeToTransient(
@@ -561,7 +1169,7 @@ export circuit createOrder(
                       disclose(price),
                       disclose(size),
                       disclose(isAsk),
-                      disclose(orderType),
+                      dOrderType,
                       disclose(nonce),
                       dExp,
                       )
@@ -572,6 +1180,8 @@ export circuit createOrder(
   assert(dSize >= cfg.minBaseAmount, "Size below minimum");
   const dPrice = disclose(price);
   assert(dPrice >= 1, "Price must be positive");
+  const reservedQuote = notionalQuote(dSize, dPrice);
+  addAccountUsage(dAccountId, reservedQuote, collateral.cap);
 
   assertAndBumpHwm(pad(32, "trading:user"), dAccountId, disclose(nonce));
 
@@ -580,6 +1190,7 @@ export circuit createOrder(
   openOrders.insert(dAccountId, disclose((currentOpen + 1) as Uint<32>));
 
   const ok = disclose(orderKey(dAccountId, nonce));
+  orderReservedQuote.insert(ok, reservedQuote);
   orders.insert(
     ok,
     disclose(Order { accountId: accountId,
@@ -606,6 +1217,10 @@ export circuit cancelOrder(accountId: Bytes<32>, nonce: Uint<64>, userSig: Schno
   assert(orders.member(ok), "Order not found");
   const order = orders.lookup(ok);
   assert(order.accountId == dAccountId, "Not order owner");
+  assert(orderReservedQuote.member(ok), "Order reserved quote missing");
+  const reservedQuote = orderReservedQuote.lookup(ok);
+  orderReservedQuote.remove(ok);
+  releaseOrderUsage(dAccountId, reservedQuote);
 
   const currentOpen = openOrders.member(dAccountId) ? openOrders.lookup(dAccountId) : 0 as Uint<32>;
   assert(currentOpen >= 1 as Uint<32>, "openOrders counter underflow");
@@ -622,6 +1237,8 @@ export circuit executeTrade(
                  marketIndex: Uint<16>,
                  fillSize: Uint<64>,
                  fillPrice: Uint<32>,
+                 executionNonce: Uint<64>,
+                 attestorSig: SchnorrSignature,
                  ): [] {
   requireSequencer();
   assert(!pausedTrading, "Trading paused");
@@ -634,11 +1251,13 @@ export circuit executeTrade(
 
   const dFillSize = disclose(fillSize);
   const dFillPrice = disclose(fillPrice);
+  const dExecutionNonce = disclose(executionNonce);
   assert(dFillSize >= cfg.minBaseAmount, "Fill below minimum");
   assert(dFillPrice >= 1, "Price must be positive");
 
   const dTaker = disclose(takerAccountId);
   const dMaker = disclose(makerAccountId);
+  assert(dTaker != dMaker, "Self-trade disabled");
   const dTakerNonce = disclose(takerOrderNonce);
   const dMakerNonce = disclose(makerOrderNonce);
 
@@ -660,12 +1279,8 @@ export circuit executeTrade(
   assert(nowTs < takerOrder.expiresAt, "Taker order expired");
   assert(nowTs < makerOrder.expiresAt, "Maker order expired");
 
-  assert(escrowMirror.member(dTaker), "Taker has no escrow mirror");
-  assert(escrowMirror.member(dMaker), "Maker has no escrow mirror");
-  const takerMirror = escrowMirror.lookup(dTaker);
-  const makerMirror = escrowMirror.lookup(dMaker);
-  assert(nowTs < takerMirror.expiresAt, "Taker escrow binding expired");
-  assert(nowTs < makerMirror.expiresAt, "Maker escrow binding expired");
+  const takerCollateral = assertActiveAccountCollateral(dTaker, nowTs);
+  const makerCollateral = assertActiveAccountCollateral(dMaker, nowTs);
   assert(dFillPrice == makerOrder.price, "Fill price must equal maker price");
   if (takerOrder.isAsk) {
     assert(makerOrder.price >= takerOrder.price, "Taker ask not crossed");
@@ -673,15 +1288,43 @@ export circuit executeTrade(
     assert(makerOrder.price <= takerOrder.price, "Taker bid not crossed");
   }
 
+  const executionHash =
+          hashExecuteTradeAuthorization(
+            dTaker,
+            dTakerNonce,
+            dMaker,
+            dMakerNonce,
+            dIdx,
+            dFillSize,
+            dFillPrice,
+            dExecutionNonce,
+            );
+  const currentExecutionNonce =
+          executionNonceHwmByMarket.member(dIdx)
+            ? executionNonceHwmByMarket.lookup(dIdx)
+            : 0 as Uint<64>;
+  assert(dExecutionNonce > currentExecutionNonce, "Execution nonce must be strictly increasing");
+  verifySchnorr(attestorSig, attestorPk, degradeToTransient(executionHash));
+  executionNonceHwmByMarket.insert(dIdx, dExecutionNonce);
+
   const newTakerRemaining = (takerOrder.remainingSize - dFillSize) as Uint<64>;
   const newMakerRemaining = (makerOrder.remainingSize - dFillSize) as Uint<64>;
+  const tradeQuote = notionalQuote(dFillSize, dFillPrice);
+  assert(orderReservedQuote.member(takerOrderK), "Taker reserved quote missing");
+  assert(orderReservedQuote.member(makerOrderK), "Maker reserved quote missing");
+  const takerReserved = orderReservedQuote.lookup(takerOrderK);
+  const makerReserved = orderReservedQuote.lookup(makerOrderK);
+  assert(takerReserved >= tradeQuote, "Taker reserved quote underflow");
+  assert(makerReserved >= tradeQuote, "Maker reserved quote underflow");
 
   if (newTakerRemaining == 0 as Uint<64>) {
     orders.remove(takerOrderK);
+    orderReservedQuote.remove(takerOrderK);
     const takerOpen = openOrders.member(dTaker) ? openOrders.lookup(dTaker) : 0 as Uint<32>;
     assert(takerOpen >= 1 as Uint<32>, "taker openOrders underflow");
     openOrders.insert(dTaker, disclose((takerOpen - 1) as Uint<32>));
   } else {
+    orderReservedQuote.insert(takerOrderK, disclose((takerReserved - tradeQuote) as Uint<128>));
     orders.insert(
       takerOrderK,
       disclose(Order { accountId: takerOrder.accountId,
@@ -697,10 +1340,12 @@ export circuit executeTrade(
 
   if (newMakerRemaining == 0 as Uint<64>) {
     orders.remove(makerOrderK);
+    orderReservedQuote.remove(makerOrderK);
     const makerOpen = openOrders.member(dMaker) ? openOrders.lookup(dMaker) : 0 as Uint<32>;
     assert(makerOpen >= 1 as Uint<32>, "maker openOrders underflow");
     openOrders.insert(dMaker, disclose((makerOpen - 1) as Uint<32>));
   } else {
+    orderReservedQuote.insert(makerOrderK, disclose((makerReserved - tradeQuote) as Uint<128>));
     orders.insert(
       makerOrderK,
       disclose(Order { accountId: makerOrder.accountId,
@@ -728,6 +1373,7 @@ export circuit executeTrade(
                          lastFundingIndex: 0 as Uint<128>,
                          lastFundingIsNeg: false, };
   const newTaker = applyFillToPosition(oldTaker, dFillSize, dFillPrice, takerIsLong, st);
+  replaceAccountPositionUsage(dTaker, tradeQuote, oldTaker.entryQuote, newTaker.entryQuote, takerCollateral.cap);
   if (disclose(newTaker.size == 0 as Uint<64>)) {
     if (positions.member(takerPosKey)) {
       positions.remove(takerPosKey);
@@ -747,6 +1393,7 @@ export circuit executeTrade(
                          lastFundingIndex: 0 as Uint<128>,
                          lastFundingIsNeg: false, };
   const newMaker = applyFillToPosition(oldMaker, dFillSize, dFillPrice, makerIsLong, st);
+  replaceAccountPositionUsage(dMaker, tradeQuote, oldMaker.entryQuote, newMaker.entryQuote, makerCollateral.cap);
   if (disclose(newMaker.size == 0 as Uint<64>)) {
     if (positions.member(makerPosKey)) {
       positions.remove(makerPosKey);
@@ -773,7 +1420,6 @@ export circuit executeTrade(
 
   assert(newOi <= cfg.openInterestLimit, "OI cap exceeded");
 
-  const tradeQuote = notionalQuote(dFillSize, dFillPrice);
   marketStates.insert(
     dIdx,
     disclose(MarketState { markPrice: st.markPrice,
@@ -796,6 +1442,10 @@ export circuit pruneOrder(accountId: Bytes<32>, orderNonce: Uint<64>,): [] {
   assert(orders.member(ok), "Order not found");
   const order = orders.lookup(ok);
   assert(order.accountId == dAccountId, "Not order owner");
+  assert(orderReservedQuote.member(ok), "Order reserved quote missing");
+  const reservedQuote = orderReservedQuote.lookup(ok);
+  orderReservedQuote.remove(ok);
+  releaseOrderUsage(dAccountId, reservedQuote);
 
   const nowTs = nowBounded();
   assert(order.expiresAt <= nowTs, "Order not yet expired");
